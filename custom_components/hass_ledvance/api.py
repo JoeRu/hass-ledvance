@@ -324,6 +324,15 @@ class TuyaAPI:
             if "result" not in result:
                 raise CannotConnect("Cloud API returned no result")
             return result["result"]
+        if result.get("errorCode") == "USER_PASSWD_WRONG":
+            # Surface which app identity/endpoint rejected the login (e.g. a Sylvania
+            # account sent through the Ledvance identity). Never log credentials or
+            # response contents.
+            _LOGGER.warning(
+                "Login rejected: USER_PASSWD_WRONG (endpoint=%s client_id=%s)",
+                self._endpoint,
+                self._client_id,
+            )
         self._raise_known_error(result.get("errorCode"), action)
         _LOGGER.error("Tuya cloud rejected the request (action=%s v=%s)", action, api_version)
         raise ValueError("Tuya cloud rejected the request")

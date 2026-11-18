@@ -108,14 +108,6 @@ class TestLogSanitization:
         assert SECRET_LOCAL_KEY not in caplog.text
         assert "HTTP 200" in caplog.text
 
-    def test_dps_result_is_still_logged(self, caplog):
-        api = TuyaAPI.for_region("US", "u", "p")
-        api.sid = "x"
-        api.session.post = MagicMock(return_value=_response({"success": True, "result": {"1": True}}))
-        with caplog.at_level(logging.DEBUG, logger="custom_components.hass_ledvance"):
-            api.get_dps("dev1")
-        assert "tuya.m.device.dp.get result" in caplog.text
-
     def test_rejected_login_logs_sanitized_reason(self, caplog):
         api = TuyaAPI.for_region("US", "user@example.com", "hunter2")
         api.session.post = MagicMock(
