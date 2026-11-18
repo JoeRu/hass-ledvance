@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.1 (pre-release candidate; not tagged)
+## 0.2.1
 
 - Propagate invalid authentication to Home Assistant reauthentication.
 - Reject cloud HTTP redirects; avoid exposing signed URLs in request exceptions.
