@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.2
 
 - Run full cloud discovery (homes, rooms, device list, per-device metadata) every 10 minutes instead of on every 30 s poll and after every command. Devices reachable on LAN now cost no cloud requests per poll; cloud-only devices cost one (`device.get`, which also keeps their online status current and picks up new local keys).
 - Keep polling known devices over LAN when cloud discovery fails, retrying discovery after 60 s instead of failing the whole refresh.
