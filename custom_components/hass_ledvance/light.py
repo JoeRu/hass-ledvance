@@ -38,6 +38,7 @@ from .const import (
     HA_COLOUR_TEMP_MIN_KELVIN,
 )
 from .coordinator import CoordinatorDeviceData, LedvanceTuyaCoordinator, build_device_info
+from .entity_discovery import register_discovered_entities
 from .local_control import async_send_and_update
 from .mixed_light import create_mixed_lights
 from .schema_parser import get_enum_range, get_integer_range
@@ -55,14 +56,13 @@ async def async_setup_entry(
 ) -> None:
     """Set up Ledvance/Tuya light entities."""
     coordinator: LedvanceTuyaCoordinator = hass.data[DOMAIN][entry.entry_id]
-    entities: list[LightEntity] = []
-    for dev_id, dev in coordinator.data.items():
+    def build_entities(dev_id: str, dev: CoordinatorDeviceData) -> list[LightEntity]:
         if dev.device_type != "light":
-            continue
+            return []
         mixed = create_mixed_lights(coordinator, entry, dev_id)
-        entities.extend(mixed or [LedvanceTuyaLight(coordinator, entry, dev_id)])
-    _LOGGER.debug("Setting up %d light entities", len(entities))
-    async_add_entities(entities)
+        return mixed or [LedvanceTuyaLight(coordinator, entry, dev_id)]
+
+    register_discovered_entities(coordinator, entry, async_add_entities, build_entities)
 
 
 class LedvanceTuyaLight(CoordinatorEntity[LedvanceTuyaCoordinator], LightEntity):

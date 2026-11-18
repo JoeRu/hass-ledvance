@@ -86,7 +86,7 @@ def get_integer_range(schema: list[dict], code: str) -> tuple[int, int]:
         return (0, 1000)
 
 
-def get_numeric_scale(schema: list[dict], code: str) -> float:
+def get_numeric_scale(schema: list[dict], code: str) -> float | None:
     """Return the divisor to convert raw Tuya integer to real-world value.
 
     Tuya encodes sensor values as integers where the 'scale' property gives
@@ -95,14 +95,17 @@ def get_numeric_scale(schema: list[dict], code: str) -> float:
     """
     item = get_schema_property(schema, code)
     if item is None:
-        return 1.0
+        return None
     try:
         prop = item.get("property", {})
         if isinstance(prop, str):
             prop = json.loads(prop)
-        return 10.0 ** int(prop.get("scale", 0))
-    except (ValueError, TypeError):
-        return 1.0
+        if not isinstance(prop, dict) or "scale" not in prop:
+            return None
+        places = int(prop["scale"])
+        return 10.0 ** places if 0 <= places <= 12 else None
+    except (ValueError, TypeError, OverflowError):
+        return None
 
 
 def get_enum_range(schema: list[dict], code: str) -> list[str]:

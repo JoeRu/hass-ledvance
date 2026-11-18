@@ -18,6 +18,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, DPS_COUNTDOWN_PREFIX
 from .coordinator import CoordinatorDeviceData, LedvanceTuyaCoordinator, build_device_info
+from .entity_discovery import register_discovered_entities
 from .local_control import async_send_and_update
 from .schema_parser import get_integer_range
 
@@ -31,11 +32,10 @@ async def async_setup_entry(
 ) -> None:
     """Set up Ledvance/Tuya number entities."""
     coordinator: LedvanceTuyaCoordinator = hass.data[DOMAIN][entry.entry_id]
-    entities: list[NumberEntity] = []
-
-    for dev_id, dev in coordinator.data.items():
+    def build_entities(dev_id: str, dev: CoordinatorDeviceData) -> list[NumberEntity]:
+        entities: list[NumberEntity] = []
         if dev.device_type != "socket_strip":
-            continue
+            return []
 
         # Find all countdown_N DPS in the schema, ordered by outlet number
         countdown_items = sorted(
@@ -57,8 +57,9 @@ async def async_setup_entry(
                 )
             )
 
-    _LOGGER.debug("Setting up %d countdown entities", len(entities))
-    async_add_entities(entities)
+        return entities
+
+    register_discovered_entities(coordinator, entry, async_add_entities, build_entities)
 
 
 class LedvanceTuyaCountdown(CoordinatorEntity[LedvanceTuyaCoordinator], NumberEntity):

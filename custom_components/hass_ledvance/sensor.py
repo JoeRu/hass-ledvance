@@ -37,6 +37,7 @@ from .const import (
     DPS_TOTAL_ENERGY,
 )
 from .coordinator import CoordinatorDeviceData, LedvanceTuyaCoordinator, build_device_info
+from .entity_discovery import register_discovered_entities
 from .schema_parser import get_numeric_scale
 
 _LOGGER = logging.getLogger(__name__)
@@ -69,13 +70,6 @@ DIAG_SENSOR_DESCRIPTIONS: tuple[LedvanceDiagSensorDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
         value_fn=lambda d: d.ip,
-    ),
-    LedvanceDiagSensorDescription(
-        key="local_key",
-        name="Local Key",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-        value_fn=lambda d: d.local_key or None,
     ),
     LedvanceDiagSensorDescription(
         key="protocol_version",
@@ -155,9 +149,8 @@ async def async_setup_entry(
 ) -> None:
     """Set up Ledvance/Tuya sensor entities."""
     coordinator: LedvanceTuyaCoordinator = hass.data[DOMAIN][entry.entry_id]
-    entities: list[SensorEntity] = []
-
-    for dev_id, dev in coordinator.data.items():
+    def build_entities(dev_id: str, dev: CoordinatorDeviceData) -> list[SensorEntity]:
+        entities: list[SensorEntity] = []
         # Diagnostic sensors for every device
         for desc in DIAG_SENSOR_DESCRIPTIONS:
             entities.append(LedvanceDiagSensor(coordinator, entry, dev_id, desc))
@@ -169,7 +162,9 @@ async def async_setup_entry(
                 if desc.dps_code in dps_codes_in_schema:
                     entities.append(LedvancePowerSensor(coordinator, entry, dev_id, desc))
 
-    async_add_entities(entities)
+        return entities
+
+    register_discovered_entities(coordinator, entry, async_add_entities, build_entities)
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +224,7 @@ class LedvancePowerSensor(CoordinatorEntity[LedvanceTuyaCoordinator], SensorEnti
 
         # Prefer the scale from the device schema; fall back to the description default
         schema_scale = get_numeric_scale(dev.schema, description.dps_code)
-        self._scale = schema_scale if schema_scale != 1.0 else description.default_scale
+        self._scale = schema_scale if schema_scale is not None else description.default_scale
 
     @property
     def _device_data(self) -> CoordinatorDeviceData:

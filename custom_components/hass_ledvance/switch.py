@@ -20,6 +20,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, DPS_CHILD_LOCK
 from .coordinator import CoordinatorDeviceData, LedvanceTuyaCoordinator, build_device_info
+from .entity_discovery import register_discovered_entities
 from .local_control import async_send_and_update
 from .schema_parser import get_socket_outlet_dps, has_hardware_master
 
@@ -33,9 +34,8 @@ async def async_setup_entry(
 ) -> None:
     """Set up Ledvance/Tuya switch entities."""
     coordinator: LedvanceTuyaCoordinator = hass.data[DOMAIN][entry.entry_id]
-    entities: list[SwitchEntity] = []
-
-    for dev_id, dev in coordinator.data.items():
+    def build_entities(dev_id: str, dev: CoordinatorDeviceData) -> list[SwitchEntity]:
+        entities: list[SwitchEntity] = []
         if dev.device_type == "switch":
             entities.append(LedvanceTuyaSwitch(coordinator, entry, dev_id))
 
@@ -62,8 +62,9 @@ async def async_setup_entry(
             if any(item.get("code") == DPS_CHILD_LOCK for item in dev.schema):
                 entities.append(LedvanceTuyaChildLock(coordinator, entry, dev_id))
 
-    _LOGGER.debug("Setting up %d switch entities", len(entities))
-    async_add_entities(entities)
+        return entities
+
+    register_discovered_entities(coordinator, entry, async_add_entities, build_entities)
 
 
 # ---------------------------------------------------------------------------

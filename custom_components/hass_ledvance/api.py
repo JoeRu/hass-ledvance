@@ -8,6 +8,8 @@ import json
 import logging
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from threading import RLock, current_thread, local
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -89,6 +91,9 @@ class TuyaAPI:
         # Called with (sid, refresh_token) whenever either is renewed
         self._on_tokens_updated = on_tokens_updated
         self.session = requests.Session()
+        self._owner_thread = current_thread()
+        self._worker_sessions = local()
+        self._login_lock = RLock()
         self.sid: str | None = None
         self.refresh_token: str = ""
         self._room_versions: dict[str, str | None] = {}
@@ -112,6 +117,17 @@ class TuyaAPI:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _request_session(self) -> requests.Session:
+        """Give worker threads independent sessions; requests.Session isn't thread-safe."""
+        if current_thread() is self._owner_thread:
+            return self.session
+        session = getattr(self._worker_sessions, "session", None)
+        if session is None:
+            session = requests.Session()
+            self._worker_sessions.session = session
+        return session
+
 
     def _api(
         self,
@@ -168,11 +184,25 @@ class TuyaAPI:
 
         for rate_attempt in range(1, 4):
             try:
-                response = self.session.post(
-                    self._endpoint, params=params, data=data, headers=headers, timeout=15
+                response = self._request_session().post(
+                    self._endpoint,
+                    params=params,
+                    data=data,
+                    headers=headers,
+                    timeout=15,
+                    allow_redirects=False,
                 )
+                # Never forward signed POST data or session IDs to redirect targets.
+                if 300 <= response.status_code < 400:
+                    raise CannotConnect("Cloud API returned an unexpected redirect")
+                response.raise_for_status()
                 action = options.get("action", "")
-                body = response.json()
+                try:
+                    body = response.json()
+                except ValueError as exc:
+                    raise CannotConnect("Cloud API returned invalid JSON") from exc
+                if not isinstance(body, dict):
+                    raise CannotConnect("Cloud API returned an unexpected payload")
                 _LOGGER.debug(
                     "API %s → HTTP %s success=%s errorCode=%s",
                     action,
@@ -204,14 +234,18 @@ class TuyaAPI:
             except InvalidUserSession:
                 if not do_not_relogin:
                     _LOGGER.info("Session expired — re-logging in")
-                    self.login()
+                    with self._login_lock:
+                        # Re-login at most once for concurrent expired-session calls.
+                        old_sid = params.get("sid")
+                        if self.sid == old_sid:
+                            self.login()
                     return self._api(
                         options, post_data, requires_sid, True, api_version=api_version
                     )
                 raise
             except requests.RequestException as exc:
-                # requests exceptions can contain signed URLs, including the SID.
-                raise CannotConnect(f"Cloud request failed ({type(exc).__name__})") from exc
+                # Requests exceptions can contain signed URLs, including the SID.
+                raise CannotConnect(f"Cloud request failed ({type(exc).__name__})") from None
         raise AssertionError("unreachable")
 
     def _sign(self, data: dict) -> str:
@@ -449,17 +483,21 @@ class TuyaAPI:
             if dev_id and room_id and room_id in room_map:
                 dev_room[dev_id] = room_map[room_id]
 
+        device_ids = [dev["devId"] for dev in raw_list or [] if dev.get("devId")]
         result = []
-        for dev in raw_list or []:  # type: ignore[union-attr]
-            dev_id = dev.get("devId")
-            if not dev_id:
-                continue
-            try:
-                info = self._device_info(dev_id)
+        # Use independent thread-local requests sessions and a bounded worker pool.
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="ledvance-cloud") as pool:
+            futures = [(dev_id, pool.submit(self._device_info, dev_id)) for dev_id in device_ids]
+            for dev_id, future in futures:
+                try:
+                    info = future.result()
+                except (InvalidAuthentication, InvalidUserSession, TooManyRequests):
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    _LOGGER.warning("Skipping device %s: %s", dev_id, type(exc).__name__)
+                    continue
                 info.room_name = dev_room.get(dev_id, "")
                 result.append(info)
-            except Exception as exc:  # noqa: BLE001
-                _LOGGER.warning("Skipping device %s: %s", dev_id, exc)
         return result
 
     def _device_info(self, device_id: str) -> DeviceInfo:

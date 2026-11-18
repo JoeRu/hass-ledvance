@@ -1,8 +1,12 @@
 # HASS Ledvance
 
-[![HACS Validation](https://github.com/buggedcom/hass-ledvance/actions/workflows/hacs.yaml/badge.svg)](https://github.com/buggedcom/hass-ledvance/actions/workflows/hacs.yaml)
-[![Hassfest](https://github.com/buggedcom/hass-ledvance/actions/workflows/hassfest.yaml/badge.svg)](https://github.com/buggedcom/hass-ledvance/actions/workflows/hassfest.yaml)
-[![Tests](https://github.com/buggedcom/hass-ledvance/actions/workflows/tests.yaml/badge.svg)](https://github.com/buggedcom/hass-ledvance/actions/workflows/tests.yaml)
+[![HACS Validation](https://github.com/Kosztyk/hass-ledvance/actions/workflows/hacs.yaml/badge.svg)](https://github.com/Kosztyk/hass-ledvance/actions/workflows/hacs.yaml)
+[![Hassfest](https://github.com/Kosztyk/hass-ledvance/actions/workflows/hassfest.yaml/badge.svg)](https://github.com/Kosztyk/hass-ledvance/actions/workflows/hassfest.yaml)
+[![Tests](https://github.com/Kosztyk/hass-ledvance/actions/workflows/tests.yaml/badge.svg)](https://github.com/Kosztyk/hass-ledvance/actions/workflows/tests.yaml)
+
+> **Project attribution:** Originally developed by [@buggedcom](https://github.com/buggedcom) in [buggedcom/hass-ledvance](https://github.com/buggedcom/hass-ledvance); continued development and testing by [@Kosztyk](https://github.com/Kosztyk). Both are credited as contributors. The original MIT license and copyright notices are retained. This repository is a fork, not a claim of original authorship.
+>
+> **HACS catalog status:** Not officially listed. A catalog submission is deferred until the original maintainer is consulted. You can install this fork as a HACS custom repository, or follow the original project.
 
 A Home Assistant custom integration for **Ledvance** and **Sylvania** smart devices. It talks directly to the Ledvance mobile app backend — no Tuya developer account, no cloud subscription, no YAML configuration required.
 
@@ -32,9 +36,11 @@ If your device is controlled through any app other than the official **Ledvance*
 - **Power monitoring** — current (A), voltage (V), active power (W), and cumulative energy (kWh) sensors for supported smart plugs and strips
 - **Fault detection** — overvoltage, overcurrent, overtemperature, and leakage current alarms exposed as binary sensors
 - **Fast online/offline detection** — online status is derived from the LAN poll result rather than waiting for the Tuya cloud heartbeat timeout, giving near-instant reactivity when a device goes offline
-- **Automatic area assignment** — fuzzy-matches Tuya room names against your existing HA areas on setup and on every update (handles typos and partial matches)
+- **Non-destructive area matching** — matches Tuya rooms against existing HA areas without overriding user-assigned areas; later updates only change assignments made during the current integration session
 - **Countdown timers** — per-outlet timers exposed as `number` entities (seconds)
-- **Token caching** — credentials are validated once; session tokens are cached so HA restarts don't trigger a fresh login or push notification
+- **Token caching and reauthentication** — cached sessions reduce repeat login requests, while expired credentials trigger Home Assistant's reauthentication flow
+- **Dynamic discovery** — newly added devices create entities on the next successful discovery refresh without an integration reload
+- **Bounded device refresh** — concurrent cloud/device reads use independent HTTP sessions and limited worker pools
 
 ---
 
@@ -119,7 +125,7 @@ These integrations (e.g. [tuya-smart-life](https://github.com/tuya/tuya-smart-li
 1. Open **HACS** in Home Assistant
 2. Go to **Integrations**
 3. Click the **⋮** menu → **Custom repositories**
-4. Add `https://github.com/buggedcom/hass-ledvance` with category **Integration**
+4. Add `https://github.com/Kosztyk/hass-ledvance` with category **Integration** (fork; not an official HACS catalog listing)
 5. Search for **HASS Ledvance** and install
 6. Restart Home Assistant
 7. Go to **Settings → Devices & Services → Add Integration** and search for **Ledvance / Tuya**
@@ -252,7 +258,7 @@ Reload the integration (**Settings → Devices & Services → Ledvance / Tuya �
 
 The integration uses fuzzy matching (exact → substring → difflib similarity ≥ 0.5) to match Tuya room names to HA areas. If a device is not being assigned to the correct area:
 - Check that an HA area with a similar name to the Tuya room exists
-- The match runs on every coordinator update, so creating the area and waiting up to 30 seconds should be sufficient
+- The match runs on coordinator updates, but only empty area assignments or areas previously assigned automatically in the current integration session will be changed. A manually assigned area is preserved. After restart, an existing assigned area is treated as user-owned.
 - Tuya room name is not exposed as an entity, but the assignment logic is logged at debug level
 
 ---
@@ -261,7 +267,7 @@ The integration uses fuzzy matching (exact → substring → difflib similarity 
 
 ```bash
 # Clone the repo
-git clone https://github.com/buggedcom/hass-ledvance.git
+git clone https://github.com/Kosztyk/hass-ledvance.git
 cd hass-ledvance
 
 # Install test dependencies (includes runtime deps)
@@ -282,7 +288,7 @@ Tests use `pytest-homeassistant-custom-component` and do not require a running H
 
 Pull requests are welcome. Please:
 
-- Run the test suite before submitting (`pytest tests/`)
+- Run the test suite and Ruff before submitting (`pytest tests/ && ruff check custom_components tests`)
 - Add or update tests for any new logic
 - Keep new device type mappings in `const.py` (`KNOWN_PRODUCT_TYPES`) with a note of the product name
 - For new DPS codes or device capabilities, open an issue first to discuss the approach
@@ -292,3 +298,18 @@ Pull requests are welcome. Please:
 ## License
 
 MIT — see [LICENSE](LICENSE) for details.
+
+## Security and maintenance
+
+- Local Tuya keys are used internally for LAN control and are **not exposed as diagnostic sensors**. If an older version created a Local Key sensor, remove its obsolete entity from the Home Assistant entity registry after upgrading.
+- Cloud API requests reject HTTP redirects to protect signed commands and session tokens.
+- Cloud connectivity is needed for initial authentication and periodic device discovery, even if local control remains available. Do not interpret LAN-first as fully offline operation.
+- If your password changes, Home Assistant will request reauthentication rather than retrying a permanently invalid password indefinitely.
+- Please report defects to [the fork issue tracker](https://github.com/Kosztyk/hass-ledvance/issues); upstream discussions and contributions remain welcome. Never attach debug logs containing passwords, session tokens, or device local keys.
+
+## Authorship and intended upstream collaboration
+
+- **Original author and upstream maintainer:** [@buggedcom](https://github.com/buggedcom), [original repository](https://github.com/buggedcom/hass-ledvance).
+- **Contributor and fork maintainer:** [@Kosztyk](https://github.com/Kosztyk), [contribution PR #11](https://github.com/buggedcom/hass-ledvance/pull/11).
+- The MIT license is preserved. The `codeowners` list includes both contributors; this does not imply that the upstream author has endorsed the fork, agreed to maintain it, or approved a HACS submission.
+- **No catalog submission has been made.** The preferred route is to coordinate with the original author on upstream integration, maintenance and who should submit to HACS.

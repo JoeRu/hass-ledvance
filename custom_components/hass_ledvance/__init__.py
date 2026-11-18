@@ -78,9 +78,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: LedvanceTuyaConfigEntry)
     # Must run after platform setup so device-registry entries exist.
     await _async_assign_areas(hass, coordinator)
 
-    # Re-run area matching on every coordinator update so that if a device's
-    # Tuya room assignment changes it is reflected in HA automatically.
-    # The guard inside _async_assign_areas skips devices that are already correct.
+    # Synchronize only areas previously assigned by the integration.
+    # Manually selected Home Assistant areas are never overwritten.
     def _on_coordinator_update() -> None:
         hass.async_create_task(_async_assign_areas(hass, coordinator))
 
@@ -158,7 +157,12 @@ async def _async_assign_areas(
         if device_entry is None:
             continue
 
-        # Only update if the area isn't already set to the same value
+        assigned = coordinator._auto_area_assignments.get(dev_id)
+        # A set area not assigned by this integration belongs to the user.
+        # If the user moved one of our assigned devices, relinquish ownership.
+        if device_entry.area_id is not None and device_entry.area_id != assigned:
+            coordinator._auto_area_assignments.pop(dev_id, None)
+            continue
         if device_entry.area_id != area_id:
             device_reg.async_update_device(device_entry.id, area_id=area_id)
             _LOGGER.debug(
@@ -168,6 +172,7 @@ async def _async_assign_areas(
                 dev_data.room_name,
                 score,
             )
+        coordinator._auto_area_assignments[dev_id] = area_id
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: LedvanceTuyaConfigEntry) -> bool:

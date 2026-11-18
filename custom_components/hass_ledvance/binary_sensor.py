@@ -35,6 +35,7 @@ from .const import (
     FAULT_OVERVOLTAGE_BIT,
 )
 from .coordinator import CoordinatorDeviceData, LedvanceTuyaCoordinator, build_device_info
+from .entity_discovery import register_discovered_entities
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -150,9 +151,8 @@ async def async_setup_entry(
 ) -> None:
     """Set up Ledvance/Tuya binary sensor entities."""
     coordinator: LedvanceTuyaCoordinator = hass.data[DOMAIN][entry.entry_id]
-    entities: list[BinarySensorEntity] = []
-
-    for dev_id, dev in coordinator.data.items():
+    def build_entities(dev_id: str, dev: CoordinatorDeviceData) -> list[BinarySensorEntity]:
+        entities: list[BinarySensorEntity] = []
         # Cloud connectivity — every device
         entities.append(LedvanceTuyaOnlineSensor(coordinator, entry, dev_id))
 
@@ -175,7 +175,9 @@ async def async_setup_entry(
                     if dps_code_map.get(desc.key, desc.key) in schema_codes:
                         entities.append(LedvanceAlarmSensor(coordinator, entry, dev_id, desc))
 
-    async_add_entities(entities)
+        return entities
+
+    register_discovered_entities(coordinator, entry, async_add_entities, build_entities)
 
 
 # ---------------------------------------------------------------------------

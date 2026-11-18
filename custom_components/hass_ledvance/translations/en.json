@@ -9,6 +9,13 @@
           "password": "Password",
           "region": "Region"
         }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate Ledvance / Sylvania",
+        "description": "Enter the updated password for your existing app account.",
+        "data": {
+          "password": "Password"
+        }
       }
     },
     "error": {

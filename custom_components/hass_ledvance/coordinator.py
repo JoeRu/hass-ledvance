@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import timedelta
 
+from homeassistant.config_entries import ConfigEntryAuthFailed
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC
 from homeassistant.helpers.entity import DeviceInfo
@@ -18,7 +20,7 @@ from .api import DeviceInfo as TuyaDeviceInfo
 from .api import TuyaAPI
 from .const import DEFAULT_SCAN_INTERVAL, DOMAIN, LAN_SCAN_INTERVAL
 from .device_io import device_lock
-from .exceptions import CannotConnect, InvalidAuthentication, TooManyRequests
+from .exceptions import CannotConnect, InvalidAuthentication, InvalidUserSession, TooManyRequests
 from .schema_parser import detect_device_type, get_dps_map
 
 _LOGGER = logging.getLogger(__name__)
@@ -85,6 +87,8 @@ class LedvanceTuyaCoordinator(DataUpdateCoordinator[DevicesData]):
         self._last_lan_scan: float = 0.0
         self._lan_monitor_task: asyncio.Task | None = None
         self._command_locks: dict[str, asyncio.Lock] = {}
+        self._auto_area_assignments: dict[str, str] = {}
+        self._cloud_retry_after: dict[str, float] = {}
 
     def command_lock(self, device_id: str) -> asyncio.Lock:
         """Serialize commands, including mixed-channel read/modify/write operations."""
@@ -109,8 +113,8 @@ class LedvanceTuyaCoordinator(DataUpdateCoordinator[DevicesData]):
 
         try:
             devices_data = await self.hass.async_add_executor_job(self._fetch_all_devices)
-        except InvalidAuthentication as exc:
-            raise UpdateFailed(f"Authentication failed: {exc}") from exc
+        except (InvalidAuthentication, InvalidUserSession) as exc:
+            raise ConfigEntryAuthFailed("Ledvance cloud credentials have expired") from exc
         except TooManyRequests as exc:
             raise UpdateFailed(f"Tuya API rate limited — will retry next poll: {exc}") from exc
         except CannotConnect as exc:
@@ -149,67 +153,78 @@ class LedvanceTuyaCoordinator(DataUpdateCoordinator[DevicesData]):
         result: DevicesData = {}
         try:
             groups = self.api.groups()
+        except (InvalidAuthentication, InvalidUserSession, TooManyRequests, CannotConnect):
+            raise
         except Exception as exc:
-            raise CannotConnect(f"Failed to fetch groups: {exc}") from exc
+            raise CannotConnect("Failed to fetch cloud groups") from exc
 
+        device_jobs: list[tuple[TuyaDeviceInfo, dict]] = []
         for group in groups:
             group_id = str(group.get("groupId") or group.get("locationId") or "")
             if not group_id:
                 continue
             try:
                 devices: list[TuyaDeviceInfo] = self.api.devices(group_id)
+            except (InvalidAuthentication, InvalidUserSession, TooManyRequests, CannotConnect):
+                raise
             except Exception as exc:  # noqa: BLE001
-                _LOGGER.warning("Failed to fetch devices for group %s: %s", group_id, exc)
+                _LOGGER.warning("Failed to fetch devices for group %s: %s", group_id, type(exc).__name__)
                 continue
+            device_jobs.extend((dev, self._lan_cache.get(dev.dev_id, {})) for dev in devices)
 
-            for dev_info in devices:
-                # Get fresh DPS — try LAN first, fall back to cloud
-                lan = self._lan_cache.get(dev_info.dev_id, {})
-                dps = self._poll_dps_local(
-                    dev_info.dev_id,
-                    lan.get("ip"),
-                    dev_info.local_key,
-                    lan.get("version"),
-                )
-                lan_reachable = dps is not None
-                if lan_reachable:
-                    _LOGGER.debug("DPS for '%s' fetched via LAN", dev_info.name)
-                else:
-                    try:
-                        dps = self.api.get_dps(dev_info.dev_id)
-                    except Exception as exc:  # noqa: BLE001
-                        _LOGGER.warning("Failed to fetch DPS for %s: %s", dev_info.dev_id, exc)
-                        dps = dev_info.dps  # last resort: keep previous values
-
-                device_type = detect_device_type(dev_info.schema, dev_info.product_id)
-                dps_map = get_dps_map(dev_info.schema)
-
-                # If the device responded on LAN it's definitely online;
-                # fall back to cloud's is_online only when LAN isn't available.
-                lan_ip = lan.get("ip")
-                is_online = lan_reachable or dev_info.is_online
-
-                result[dev_info.dev_id] = CoordinatorDeviceData(
-                    device_id=dev_info.dev_id,
-                    gateway_id=dev_info.gateway_id,
-                    name=dev_info.name,
-                    product_id=dev_info.product_id,
-                    device_type=device_type,
-                    schema=dev_info.schema,
-                    dps_map=dps_map,
-                    dps=dps,
-                    local_key=dev_info.local_key,
-                    mac=dev_info.mac,
-                    is_online=is_online,
-                    ip=dev_info.ip,
-                    lan_ip=lan_ip,
-                    version=lan.get("version"),  # LAN scan only — cloud pv is unrelated
-                    fw_version=dev_info.fw_version,
-                    room_name=dev_info.room_name,
-                )
+        # At most three devices are polled concurrently. Each cloud worker uses
+        # its own Session, avoiding unsafe sharing of requests connection state.
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="ledvance-poll") as pool:
+            futures = [pool.submit(self._fetch_device, dev, lan) for dev, lan in device_jobs]
+            for future in futures:
+                device = future.result()  # propagate authentication and rate-limit failures
+                result[device.device_id] = device
 
         _LOGGER.debug("Fetched %d devices from cloud", len(result))
         return result
+
+    def _fetch_device(self, dev_info: TuyaDeviceInfo, lan: dict) -> CoordinatorDeviceData:
+        """Poll a device with LAN priority and bounded cloud failure backoff."""
+        dps = self._poll_dps_local(
+            dev_info.dev_id, lan.get("ip"), dev_info.local_key, lan.get("version")
+        )
+        lan_reachable = dps is not None
+        if not lan_reachable:
+            now = time.monotonic()
+            if now >= self._cloud_retry_after.get(dev_info.dev_id, 0):
+                try:
+                    dps = self.api.get_dps(dev_info.dev_id)
+                    self._cloud_retry_after.pop(dev_info.dev_id, None)
+                except (InvalidAuthentication, InvalidUserSession, TooManyRequests):
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    # Don't retry a persistently failing device on every refresh.
+                    self._cloud_retry_after[dev_info.dev_id] = now + 60
+                    _LOGGER.warning(
+                        "Cloud DPS for %s unavailable (%s); retrying later",
+                        dev_info.dev_id, type(exc).__name__,
+                    )
+            if dps is None:
+                dps = dev_info.dps
+
+        return CoordinatorDeviceData(
+            device_id=dev_info.dev_id,
+            gateway_id=dev_info.gateway_id,
+            name=dev_info.name,
+            product_id=dev_info.product_id,
+            device_type=detect_device_type(dev_info.schema, dev_info.product_id),
+            schema=dev_info.schema,
+            dps_map=get_dps_map(dev_info.schema),
+            dps=dps,
+            local_key=dev_info.local_key,
+            mac=dev_info.mac,
+            is_online=lan_reachable or dev_info.is_online,
+            ip=dev_info.ip,
+            lan_ip=lan.get("ip"),
+            version=lan.get("version"),
+            fw_version=dev_info.fw_version,
+            room_name=dev_info.room_name,
+        )
 
     @staticmethod
     def _poll_dps_local(

@@ -137,12 +137,20 @@ class TestGetNumericScale:
         # bright_value has scale 0
         assert get_numeric_scale(light_schema, "bright_value") == 1.0
 
-    def test_missing_code_returns_1(self, light_schema):
-        assert get_numeric_scale(light_schema, "nonexistent") == 1.0
+    def test_missing_code_returns_none(self, light_schema):
+        assert get_numeric_scale(light_schema, "nonexistent") is None
 
-    def test_missing_scale_key_defaults_to_0(self):
+    def test_missing_scale_key_returns_none(self):
         schema = [{"id": 1, "code": "val", "property": {"min": 0, "max": 100}}]
-        assert get_numeric_scale(schema, "val") == 1.0
+        assert get_numeric_scale(schema, "val") is None
+
+    def test_malformed_scale_returns_none(self):
+        schema = [{"id": 1, "code": "val", "property": '{"scale":"invalid"}'}]
+        assert get_numeric_scale(schema, "val") is None
+
+    def test_unreasonable_scale_returns_none(self):
+        schema = [{"id": 1, "code": "val", "property": {"scale": -100}}]
+        assert get_numeric_scale(schema, "val") is None
 
 
 # ---------------------------------------------------------------------------

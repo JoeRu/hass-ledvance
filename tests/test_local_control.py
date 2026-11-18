@@ -29,9 +29,9 @@ class _FakeDevice:
 # ---------------------------------------------------------------------------
 
 def _make_tinytuya_mock(success: bool = True):
-    """Return a mock tinytuya module whose OutletDevice.set_status behaves as requested."""
+    """Return a mock tinytuya module matching OutletDevice.set_multiple_values."""
     device_mock = MagicMock()
-    device_mock.set_status.return_value = {} if success else {"Error": "timeout"}
+    device_mock.set_multiple_values.return_value = {} if success else {"Error": "timeout"}
     tinytuya_mock = MagicMock()
     tinytuya_mock.OutletDevice.return_value = device_mock
     return tinytuya_mock, device_mock
@@ -60,6 +60,14 @@ class TestLocalControlSuccess:
 
         mock_api.set_dps.assert_not_called()
 
+    async def test_local_uses_multiple_values_and_waits_for_ack(self, hass, mock_api):
+        device = _FakeDevice(lan_ip="192.168.1.50", local_key="abc", version="3.3")
+        tinytuya_mock, device_mock = _make_tinytuya_mock()
+        with patch.dict("sys.modules", {"tinytuya": tinytuya_mock}):
+            assert await async_send_command(hass, mock_api, device, {"1": True})
+        device_mock.set_multiple_values.assert_called_once_with({"1": True}, nowait=False)
+        device_mock.close.assert_called_once()
+
     async def test_sets_correct_socket_timeout(self, hass, mock_api):
         device = _FakeDevice(lan_ip="192.168.1.50", local_key="abc", version="3.3")
         tinytuya_mock, device_mock = _make_tinytuya_mock(success=True)
@@ -84,6 +92,23 @@ class TestLocalControlFallback:
 
         assert result is True
         mock_api.set_dps.assert_called_once_with("dev001", None, {"1": True})
+
+    @pytest.mark.parametrize("bad_ack", [False, {"Error": "timeout"}, {"Error": "rejected"}])
+    async def test_rejected_ack_falls_back(self, hass, mock_api, bad_ack):
+        device = _FakeDevice(lan_ip="192.168.1.50", local_key="abc", version="3.3")
+        tinytuya_mock, device_mock = _make_tinytuya_mock()
+        device_mock.set_multiple_values.return_value = bad_ack
+        with patch.dict("sys.modules", {"tinytuya": tinytuya_mock}):
+            assert await async_send_command(hass, mock_api, device, {"1": False})
+        mock_api.set_dps.assert_called_once()
+
+    async def test_falls_back_to_cloud_on_timeout(self, hass, mock_api):
+        device = _FakeDevice(lan_ip="192.168.1.50", local_key="abc", version="3.3")
+        tinytuya_mock, device_mock = _make_tinytuya_mock()
+        device_mock.set_multiple_values.side_effect = TimeoutError("timeout")
+        with patch.dict("sys.modules", {"tinytuya": tinytuya_mock}):
+            assert await async_send_command(hass, mock_api, device, {"1": True})
+        mock_api.set_dps.assert_called_once()
 
     async def test_falls_back_to_cloud_on_exception(self, hass, mock_api):
         device = _FakeDevice(lan_ip="192.168.1.50", local_key="abc", version="3.3")
