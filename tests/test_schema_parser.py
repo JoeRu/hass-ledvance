@@ -12,7 +12,6 @@ from custom_components.hass_ledvance.schema_parser import (
     has_hardware_master,
 )
 
-
 # ---------------------------------------------------------------------------
 # detect_device_type
 # ---------------------------------------------------------------------------
@@ -64,7 +63,6 @@ class TestDetectDeviceType:
         ]
         assert detect_device_type(schema, "any") == "light"
 
-
 # ---------------------------------------------------------------------------
 # get_dps_map
 # ---------------------------------------------------------------------------
@@ -96,7 +94,6 @@ class TestGetDpsMap:
     def test_empty_schema(self):
         assert get_dps_map([]) == {}
 
-
 # ---------------------------------------------------------------------------
 # get_integer_range
 # ---------------------------------------------------------------------------
@@ -119,7 +116,6 @@ class TestGetIntegerRange:
     def test_missing_property_uses_defaults(self):
         schema = [{"id": 1, "code": "val"}]
         assert get_integer_range(schema, "val") == (0, 1000)
-
 
 # ---------------------------------------------------------------------------
 # get_numeric_scale
@@ -151,7 +147,6 @@ class TestGetNumericScale:
         schema = [{"id": 1, "code": "val", "property": {"scale": -100}}]
         assert get_numeric_scale(schema, "val") is None
 
-
 # ---------------------------------------------------------------------------
 # get_enum_range
 # ---------------------------------------------------------------------------
@@ -167,7 +162,6 @@ class TestGetEnumRange:
     def test_empty_range(self):
         schema = [{"id": 1, "code": "mode", "property": {"range": []}}]
         assert get_enum_range(schema, "mode") == []
-
 
 # ---------------------------------------------------------------------------
 # get_socket_outlet_dps
@@ -241,7 +235,6 @@ class TestGetSocketOutletDps:
 
     def test_empty_schema(self):
         assert get_socket_outlet_dps([]) == []
-
 
 # ---------------------------------------------------------------------------
 # has_hardware_master

@@ -15,9 +15,6 @@ jobs:
       - uses: astral-sh/ruff-action@v3
         with:
           args: "check custom_components tests"
-      - name: Diagnose import ordering
-        if: failure()
-        run: ruff check --diff --select I custom_components tests || true
       - name: Compile integration
         run: python -m compileall -q custom_components/hass_ledvance
 

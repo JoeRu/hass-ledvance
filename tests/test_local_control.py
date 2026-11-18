@@ -9,7 +9,6 @@ import pytest
 
 from custom_components.hass_ledvance.local_control import async_send_command
 
-
 # ---------------------------------------------------------------------------
 # Minimal CoordinatorDeviceData stand-in
 # ---------------------------------------------------------------------------
@@ -24,7 +23,6 @@ class _FakeDevice:
     version: str | None = None
     dps: dict = field(default_factory=dict)
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -36,7 +34,6 @@ def _make_tinytuya_mock(success: bool = True):
     tinytuya_mock = MagicMock()
     tinytuya_mock.OutletDevice.return_value = device_mock
     return tinytuya_mock, device_mock
-
 
 # ---------------------------------------------------------------------------
 # Local control path
@@ -77,7 +74,6 @@ class TestLocalControlSuccess:
             await async_send_command(hass, mock_api, device, {"1": True})
 
         device_mock.set_socketTimeout.assert_called_once_with(3)
-
 
 # ---------------------------------------------------------------------------
 # Local control failure → cloud fallback
@@ -132,7 +128,6 @@ class TestLocalControlFallback:
         assert result is True
         mock_api.set_dps.assert_called_once()
 
-
 # ---------------------------------------------------------------------------
 # No LAN IP → goes straight to cloud
 # ---------------------------------------------------------------------------
@@ -161,7 +156,6 @@ class TestNoLanIp:
 
         assert result is True
         mock_api.set_dps.assert_called_once()
-
 
 # ---------------------------------------------------------------------------
 # Cloud failure

@@ -7,7 +7,6 @@ import pytest
 # Import the private helper directly (it's pure Python, no HA dep)
 from custom_components.hass_ledvance.__init__ import _find_best_area
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -28,7 +27,6 @@ def area_by_name() -> dict[str, str]:
         "outside":             "outside",
     }
 
-
 # ---------------------------------------------------------------------------
 # Tier 1 — exact match
 # ---------------------------------------------------------------------------
@@ -48,7 +46,6 @@ class TestExactMatch:
         area_id, matched, score = _find_best_area("SAUNA", area_by_name)
         assert area_id == "sauna"
         assert score == 1.0
-
 
 # ---------------------------------------------------------------------------
 # Tier 2 — substring containment
@@ -74,7 +71,6 @@ class TestSubstringMatch:
         # "sauna lounge" is an exact match → takes tier 1; confirm
         assert score == 1.0
         assert area_id == "sauna_lounge"
-
 
 # ---------------------------------------------------------------------------
 # Tier 3 — fuzzy similarity
@@ -103,7 +99,6 @@ class TestFuzzyMatch:
         area_id, matched, score = _find_best_area("Office", {})
         assert area_id is None
         assert score == 0.0
-
 
 # ---------------------------------------------------------------------------
 # Edge cases
