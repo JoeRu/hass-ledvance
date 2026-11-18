@@ -1,4 +1,5 @@
 """Tests for custom_components.hass_ledvance.local_control."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

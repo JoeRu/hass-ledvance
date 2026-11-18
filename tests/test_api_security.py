@@ -18,9 +18,11 @@ def make_api():
 def test_rejects_redirect_without_forwarding_secret(status):
     api = make_api()
     response = MagicMock(status_code=status)
-    with patch.object(api.session, "post", return_value=response) as post:
-        with pytest.raises(CannotConnect, match="redirect"):
-            api._api({"action": "test"}, {"key": "sensitive"})
+    with (
+        patch.object(api.session, "post", return_value=response) as post,
+        pytest.raises(CannotConnect, match="redirect"),
+    ):
+        api._api({"action": "test"}, {"key": "sensitive"})
     assert post.call_args.kwargs["allow_redirects"] is False
     response.json.assert_not_called()
 
@@ -29,18 +31,22 @@ def test_rejects_unexpected_json_shape():
     api = make_api()
     response = MagicMock(status_code=200)
     response.json.return_value = []
-    with patch.object(api.session, "post", return_value=response):
-        with pytest.raises(CannotConnect, match="payload"):
-            api._api({"action": "test"})
+    with (
+        patch.object(api.session, "post", return_value=response),
+        pytest.raises(CannotConnect, match="payload"),
+    ):
+        api._api({"action": "test"})
 
 
 def test_rejects_invalid_json():
     api = make_api()
     response = MagicMock(status_code=200)
     response.json.side_effect = ValueError("invalid")
-    with patch.object(api.session, "post", return_value=response):
-        with pytest.raises(CannotConnect, match="JSON"):
-            api._api({"action": "test"})
+    with (
+        patch.object(api.session, "post", return_value=response),
+        pytest.raises(CannotConnect, match="JSON"),
+    ):
+        api._api({"action": "test"})
 
 
 def test_device_auth_failure_propagates():

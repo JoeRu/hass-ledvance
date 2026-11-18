@@ -12,7 +12,6 @@
   "issue_tracker": "https://github.com/Kosztyk/hass-ledvance/issues",
   "requirements": [
     "pycryptodome>=3.17",
-    "requests>=2.31.0",
     "tinytuya>=1.17.4"
   ],
   "version": "0.2.1"

@@ -1,4 +1,5 @@
 """Tests for the fuzzy area-matching logic in __init__.py."""
+
 from __future__ import annotations
 
 import pytest

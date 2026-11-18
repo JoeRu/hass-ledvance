@@ -1,7 +1,6 @@
 """Tests for custom_components.hass_ledvance.schema_parser."""
-from __future__ import annotations
 
-import pytest
+from __future__ import annotations
 
 from custom_components.hass_ledvance.schema_parser import (
     detect_device_type,
@@ -236,7 +235,7 @@ class TestGetSocketOutletDps:
         ]
         result = get_socket_outlet_dps(schema)
         # master_switch wins; switch_all should not appear
-        master_entries = [(c, l) for c, l in result if c in ("master_switch", "switch_all")]
+        master_entries = [(code, label) for code, label in result if code in ("master_switch", "switch_all")]
         assert len(master_entries) == 1
         assert master_entries[0][0] == "master_switch"
 
