@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import suppress
 
 from .const import KNOWN_PRODUCT_TYPES
 
@@ -20,6 +21,18 @@ _LIGHT_CODES = frozenset(
 )
 
 
+def normalize_schema(schema: object) -> list[dict]:
+    """Keep usable data points from an optional device schema."""
+    if schema is None:
+        return []
+    if not isinstance(schema, list):
+        raise ValueError("Unexpected device schema")
+    return [
+        item for item in schema
+        if isinstance(item, dict) and isinstance(item.get("code"), str) and item.get("id") is not None
+    ]
+
+
 def detect_device_type(schema: list[dict], product_id: str) -> str:
     """Return 'light', 'socket_strip', 'switch', or 'unknown' for a device.
 
@@ -35,7 +48,7 @@ def detect_device_type(schema: list[dict], product_id: str) -> str:
 
     # Socket strip: requires multiple numbered outlets (switch_1, switch_2, …)
     # A single smart plug with power monitoring DPS is still just a "switch".
-    numbered_switches = [c for c in codes if c.startswith("switch_") and c[7:].isdigit()]
+    numbered_switches = [c for c in codes if c.startswith("switch_") and c[7:].isdecimal()]
     if len(numbered_switches) > 1:
         return "socket_strip"
 
@@ -72,54 +85,50 @@ def get_schema_property(schema: list[dict], code: str) -> dict | None:
     return None
 
 
+def _get_properties(schema: list[dict], code: str) -> dict:
+    """Return the data point properties whether supplied as an object or JSON."""
+    prop = (get_schema_property(schema, code) or {}).get("property")
+    if isinstance(prop, str):
+        with suppress(ValueError):
+            prop = json.loads(prop)
+    return prop if isinstance(prop, dict) else {}
+
+
 def get_integer_range(schema: list[dict], code: str) -> tuple[int, int]:
     """Return (min, max) for an Integer-type DPS, or (0, 1000) as default."""
-    item = get_schema_property(schema, code)
-    if item is None:
-        return (0, 1000)
+    prop = _get_properties(schema, code)
     try:
-        prop = item.get("property", {})
-        if isinstance(prop, str):
-            prop = json.loads(prop)
-        return (int(prop.get("min", 0)), int(prop.get("max", 1000)))
-    except (ValueError, TypeError, KeyError):
+        lo, hi = int(prop.get("min", 0)), int(prop.get("max", 1000))
+        return (lo, hi) if lo <= hi else (0, 1000)
+    except (ValueError, TypeError, OverflowError):
         return (0, 1000)
 
 
 def get_numeric_scale(schema: list[dict], code: str) -> float | None:
-    """Return the divisor to convert raw Tuya integer to real-world value.
+    """Return the decimal divisor for a raw Tuya value in its declared unit.
 
     Tuya encodes sensor values as integers where the 'scale' property gives
-    the number of decimal places (i.e. raw / 10**scale = real value).
-    E.g. scale=1 → divide by 10 (0.1 V steps), scale=3 → divide by 1000 (mA → A).
+    the number of decimal places. A scale of 1 divides the raw value by 10.
     """
-    item = get_schema_property(schema, code)
-    if item is None:
-        return None
     try:
-        prop = item.get("property", {})
-        if isinstance(prop, str):
-            prop = json.loads(prop)
-        if not isinstance(prop, dict) or "scale" not in prop:
-            return None
-        places = int(prop["scale"])
+        places = int(_get_properties(schema, code).get("scale"))
         return 10.0 ** places if 0 <= places <= 12 else None
     except (ValueError, TypeError, OverflowError):
         return None
 
 
+def get_numeric_unit(schema: list[dict], code: str) -> str:
+    """Return the reported measurement unit if supplied."""
+    unit = _get_properties(schema, code).get("unit")
+    return unit.strip() if isinstance(unit, str) else ""
+
+
 def get_enum_range(schema: list[dict], code: str) -> list[str]:
     """Return list of valid enum values for an Enum-type DPS, or []."""
-    item = get_schema_property(schema, code)
-    if item is None:
+    values = _get_properties(schema, code).get("range")
+    if not isinstance(values, list):
         return []
-    try:
-        prop = item.get("property", {})
-        if isinstance(prop, str):
-            prop = json.loads(prop)
-        return list(prop.get("range", []))
-    except (ValueError, TypeError):
-        return []
+    return [value for value in values if isinstance(value, str)]
 
 
 def get_socket_outlet_dps(schema: list[dict]) -> list[tuple[str, str]]:
@@ -133,7 +142,7 @@ def get_socket_outlet_dps(schema: list[dict]) -> list[tuple[str, str]]:
 
     # Numbered outlets: switch_1, switch_2, …
     numbered = sorted(
-        (c for c in codes if c.startswith("switch_") and c[7:].isdigit()),
+        (c for c in codes if c.startswith("switch_") and c[7:].isdecimal()),
         key=lambda c: int(c[7:]),
     )
     for code in numbered:

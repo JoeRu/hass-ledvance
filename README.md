@@ -35,8 +35,8 @@ If your device is controlled through any app other than the official **Ledvance*
 - **Multi-gang socket strips** — each outlet is individually controllable, with a synthesised "All Outlets" master switch for strips that lack a hardware master DPS
 - **Power monitoring** — current (A), voltage (V), active power (W), and cumulative energy (kWh) sensors for supported smart plugs and strips
 - **Fault detection** — overvoltage, overcurrent, overtemperature, and leakage current alarms exposed as binary sensors
-- **Fast online/offline detection** — online status is derived from the LAN poll result rather than waiting for the Tuya cloud heartbeat timeout, giving near-instant reactivity when a device goes offline
-- **Non-destructive area matching** — matches Tuya rooms against existing HA areas without overriding user-assigned areas; later updates only change assignments made during the current integration session
+- **LAN-first status** — successful LAN polls immediately confirm that a device is online. Scheduled cloud refreshes provide fallback state and discover devices independently of local updates.
+- **Non-destructive area matching** — matches Tuya rooms against existing Home Assistant areas and preserves manual assignments and clears across reloads.
 - **Countdown timers** — per-outlet timers exposed as `number` entities (seconds)
 - **Token caching and reauthentication** — cached sessions reduce repeat login requests, while expired credentials trigger Home Assistant's reauthentication flow
 - **Dynamic discovery** — newly added devices create entities on the next successful discovery refresh without an integration reload
@@ -228,8 +228,6 @@ Per-outlet countdown timers (in seconds) where supported by the device.
 | LAN IP Address | ✓ | IP discovered via LAN scan — used for local control |
 | Protocol Version | ✓ | Tuya protocol version in use (3.1 / 3.3 / 3.4) |
 | Cloud IP Address | — | IP reported by Tuya cloud (usually your WAN IP); disabled by default |
-| Local Key | — | Device encryption key; disabled by default |
-| Device ID | — | Tuya device ID; disabled by default |
 
 ---
 
@@ -258,7 +256,7 @@ Reload the integration (**Settings → Devices & Services → Ledvance / Tuya �
 
 The integration uses fuzzy matching (exact → substring → difflib similarity ≥ 0.5) to match Tuya room names to HA areas. If a device is not being assigned to the correct area:
 - Check that an HA area with a similar name to the Tuya room exists
-- The match runs on coordinator updates, but only empty area assignments or areas previously assigned automatically in the current integration session will be changed. A manually assigned area is preserved. After restart, an existing assigned area is treated as user-owned.
+- The match can fill a previously unassigned area or follow a Tuya room change for an automatically assigned device. Moving or clearing an assignment in Home Assistant stops auto-assignment for that device. Existing areas without saved ownership are treated as manual assignments.
 - Tuya room name is not exposed as an entity, but the assignment logic is logged at debug level
 
 ---
@@ -301,8 +299,8 @@ MIT — see [LICENSE](LICENSE) for details.
 
 ## Security and maintenance
 
-- Local Tuya keys are used internally for LAN control and are **not exposed as diagnostic sensors**. If an older version created a Local Key sensor, remove its obsolete entity from the Home Assistant entity registry after upgrading.
-- Cloud API requests reject HTTP redirects to protect signed commands and session tokens.
+- The integration uses local Tuya keys internally for LAN control. If you enabled a Local Key sensor in an older version, note its exact entity ID before removing it. In **Developer tools → Actions**, run [`recorder.purge_entities`](https://www.home-assistant.io/integrations/recorder/#actions) for those entity IDs if Recorder captured their values. Then remove the obsolete entities and reload the integration. Review backups and exports that contain the old history separately.
+- Cloud API requests reject redirects. The integration suppresses urllib3 transport logs for its signed HTTP requests to keep session URLs out of debug output.
 - Cloud connectivity is needed for initial authentication and periodic device discovery, even if local control remains available. Do not interpret LAN-first as fully offline operation.
 - If your password changes, Home Assistant will request reauthentication rather than retrying a permanently invalid password indefinitely.
 - Please report defects to [the fork issue tracker](https://github.com/Kosztyk/hass-ledvance/issues); upstream discussions and contributions remain welcome. Never attach debug logs containing passwords, session tokens, or device local keys.

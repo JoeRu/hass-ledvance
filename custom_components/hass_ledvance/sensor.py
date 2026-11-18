@@ -1,8 +1,7 @@
 """Sensor platform for Ledvance/Tuya integration.
 
-Two categories:
-  - Diagnostic sensors (all devices)     — device ID, IP, MAC, local key, firmware version
-  - Power monitoring sensors (socket_strip) — current, voltage, power, energy
+Diagnostic sensors show connection information. Power monitoring sensors show
+current, voltage, power, and energy on supported outlets.
 """
 
 from __future__ import annotations
@@ -10,6 +9,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from math import isfinite
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -27,7 +27,13 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util.unit_conversion import (
+    BaseUnitConverter,
+    ElectricCurrentConverter,
+    ElectricPotentialConverter,
+    EnergyConverter,
+    PowerConverter,
+)
 
 from .const import (
     DOMAIN,
@@ -36,11 +42,13 @@ from .const import (
     DPS_CUR_VOLTAGE,
     DPS_TOTAL_ENERGY,
 )
-from .coordinator import CoordinatorDeviceData, LedvanceTuyaCoordinator, build_device_info
+from .coordinator import CoordinatorDeviceData, LedvanceDeviceEntity, LedvanceTuyaCoordinator
 from .entity_discovery import register_discovered_entities
-from .schema_parser import get_numeric_scale
+from .schema_parser import get_numeric_scale, get_numeric_unit
 
 _LOGGER = logging.getLogger(__name__)
+
+_UNIT_ALIASES = {"a": "A", "ma": "mA", "v": "V", "mv": "mV", "w": "W", "kw": "kW", "wh": "Wh", "kwh": "kWh"}
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +98,7 @@ class LedvancePowerSensorDescription(SensorEntityDescription):
     """Power-monitoring sensor: DPS code + optional default scale divisor."""
 
     dps_code: str
+    unit_converter: type[BaseUnitConverter]
     default_scale: float = 1.0  # fallback if schema has no 'scale' property
 
 
@@ -98,6 +107,7 @@ POWER_SENSOR_DESCRIPTIONS: tuple[LedvancePowerSensorDescription, ...] = (
         key="current",
         name="Current",
         dps_code=DPS_CUR_CURRENT,
+        unit_converter=ElectricCurrentConverter,
         default_scale=1000.0,  # Tuya typically reports mA
         device_class=SensorDeviceClass.CURRENT,
         state_class=SensorStateClass.MEASUREMENT,
@@ -108,6 +118,7 @@ POWER_SENSOR_DESCRIPTIONS: tuple[LedvancePowerSensorDescription, ...] = (
         key="voltage",
         name="Voltage",
         dps_code=DPS_CUR_VOLTAGE,
+        unit_converter=ElectricPotentialConverter,
         default_scale=10.0,  # Tuya typically reports 0.1 V steps
         device_class=SensorDeviceClass.VOLTAGE,
         state_class=SensorStateClass.MEASUREMENT,
@@ -118,6 +129,7 @@ POWER_SENSOR_DESCRIPTIONS: tuple[LedvancePowerSensorDescription, ...] = (
         key="power",
         name="Power",
         dps_code=DPS_CUR_POWER,
+        unit_converter=PowerConverter,
         default_scale=10.0,  # Tuya typically reports 0.1 W steps
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
@@ -128,6 +140,7 @@ POWER_SENSOR_DESCRIPTIONS: tuple[LedvancePowerSensorDescription, ...] = (
         key="energy",
         name="Energy",
         dps_code=DPS_TOTAL_ENERGY,
+        unit_converter=EnergyConverter,
         default_scale=1000.0,  # Tuya typically reports Wh; HA wants kWh
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.TOTAL_INCREASING,
@@ -149,6 +162,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up Ledvance/Tuya sensor entities."""
     coordinator: LedvanceTuyaCoordinator = hass.data[DOMAIN][entry.entry_id]
+
     def build_entities(dev_id: str, dev: CoordinatorDeviceData) -> list[SensorEntity]:
         entities: list[SensorEntity] = []
         # Diagnostic sensors for every device
@@ -172,7 +186,7 @@ async def async_setup_entry(
 # ---------------------------------------------------------------------------
 
 
-class LedvanceDiagSensor(CoordinatorEntity[LedvanceTuyaCoordinator], SensorEntity):
+class LedvanceDiagSensor(LedvanceDeviceEntity, SensorEntity):
     """A diagnostic (text) sensor for any Ledvance/Tuya device."""
 
     entity_description: LedvanceDiagSensorDescription
@@ -185,22 +199,17 @@ class LedvanceDiagSensor(CoordinatorEntity[LedvanceTuyaCoordinator], SensorEntit
         device_id: str,
         description: LedvanceDiagSensorDescription,
     ) -> None:
-        super().__init__(coordinator)
-        self._device_id = device_id
+        super().__init__(coordinator, device_id)
         self.entity_description = description
         self._attr_unique_id = f"{entry.entry_id}_{device_id}_{description.key}"
-        self._attr_device_info = build_device_info(coordinator.data[device_id])
-
-    @property
-    def _device_data(self) -> CoordinatorDeviceData:
-        return self.coordinator.data[self._device_id]
 
     @property
     def native_value(self) -> str | None:
-        return self.entity_description.value_fn(self._device_data)
+        device = self._device_data
+        return self.entity_description.value_fn(device) if device is not None else None
 
 
-class LedvancePowerSensor(CoordinatorEntity[LedvanceTuyaCoordinator], SensorEntity):
+class LedvancePowerSensor(LedvanceDeviceEntity, SensorEntity):
     """A power-monitoring sensor on a Ledvance/Tuya socket strip."""
 
     entity_description: LedvancePowerSensorDescription
@@ -213,31 +222,33 @@ class LedvancePowerSensor(CoordinatorEntity[LedvanceTuyaCoordinator], SensorEnti
         device_id: str,
         description: LedvancePowerSensorDescription,
     ) -> None:
-        super().__init__(coordinator)
-        self._device_id = device_id
+        super().__init__(coordinator, device_id)
         self.entity_description = description
         self._attr_unique_id = f"{entry.entry_id}_{device_id}_{description.key}"
 
         dev = coordinator.data[device_id]
-        self._attr_device_info = build_device_info(dev)
         self._dps: str | None = dev.dps_map.get(description.dps_code)
-
-        # Prefer the scale from the device schema; fall back to the description default
         schema_scale = get_numeric_scale(dev.schema, description.dps_code)
-        self._scale = schema_scale if schema_scale is not None else description.default_scale
-
-    @property
-    def _device_data(self) -> CoordinatorDeviceData:
-        return self.coordinator.data[self._device_id]
+        self._divisor = description.default_scale if schema_scale is None else schema_scale
+        self._unit_factor = 1.0
+        if schema_scale is not None:
+            reported_unit = get_numeric_unit(dev.schema, description.dps_code)
+            source_unit = _UNIT_ALIASES.get(reported_unit.casefold(), reported_unit)
+            converter = description.unit_converter
+            if source_unit in converter.VALID_UNITS:
+                self._unit_factor = converter.convert(
+                    1.0, source_unit, description.native_unit_of_measurement
+                )
 
     @property
     def native_value(self) -> float | None:
         if self._dps is None:
             return None
-        raw = self._device_data.dps.get(self._dps)
+        raw = self._state_dps.get(self._dps)
         if raw is None:
             return None
         try:
-            return round(float(raw) / self._scale, 6)
-        except (TypeError, ValueError):
+            value = float(raw) / self._divisor * self._unit_factor
+            return round(value, 6) if isfinite(value) else None
+        except (TypeError, ValueError, OverflowError):
             return None

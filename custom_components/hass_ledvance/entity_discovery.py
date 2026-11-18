@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import callback
 from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -17,26 +18,26 @@ def register_discovered_entities(
     async_add_entities: AddEntitiesCallback,
     create_for_device: Callable[[str, CoordinatorDeviceData], Iterable[Entity]],
 ) -> None:
-    """Add each discovered device once per platform, including during initial setup.
+    """Add entities for new devices and for capabilities discovered later.
 
-    A platform can create multiple entities for one device. Existing entity IDs
-    are stable because the same platform factories are used for initial and late
-    discovery. Devices that disappear temporarily are not re-registered.
+    Keep registered entity IDs so a temporarily missing device can recover its
+    existing entities when it reappears.
     """
-    seen_devices: set[str] = set()
+    device_schemas: dict[str, tuple[str, list[dict]]] = {}
+    registered_ids: set[str] = set()
 
+    @callback
     def add_new_devices() -> None:
-        if not coordinator.data:
-            return
-        new_devices = [
-            (dev_id, dev)
-            for dev_id, dev in coordinator.data.items()
-            if dev_id not in seen_devices
-        ]
         entities: list[Entity] = []
-        for dev_id, dev in new_devices:
-            entities.extend(create_for_device(dev_id, dev))
-            seen_devices.add(dev_id)
+        for dev_id, dev in (coordinator.data or {}).items():
+            schema = (dev.device_type, dev.schema)
+            if device_schemas.get(dev_id) == schema:
+                continue
+            for entity in create_for_device(dev_id, dev):
+                if (unique_id := entity.unique_id) is not None and unique_id not in registered_ids:
+                    registered_ids.add(unique_id)
+                    entities.append(entity)
+            device_schemas[dev_id] = schema
         if entities:
             async_add_entities(entities)
 

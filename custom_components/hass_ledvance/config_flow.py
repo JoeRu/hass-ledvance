@@ -12,7 +12,7 @@ from homeassistant.core import HomeAssistant
 
 from .api import TuyaAPI
 from .const import CONF_REGION, DEFAULT_REGION, DOMAIN, REGIONS, region_app
-from .exceptions import CannotConnect, InvalidAuthentication
+from .exceptions import CannotConnect, InvalidAuthentication, InvalidUserSession, TooManyRequests
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -44,13 +44,15 @@ class LedvanceTuyaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             try:
                 await _validate_credentials(self.hass, user_input)
-            except InvalidAuthentication:
+            except (InvalidAuthentication, InvalidUserSession):
                 _LOGGER.warning(
                     "Authentication failed (region=%s, app=%s)",
                     user_input[CONF_REGION],
                     region_app(user_input[CONF_REGION]),
                 )
                 errors["base"] = "invalid_auth"
+            except TooManyRequests:
+                errors["base"] = "rate_limited"
             except CannotConnect as exc:
                 _LOGGER.warning(
                     "Cannot connect to Tuya cloud (region=%s): %s",
@@ -97,8 +99,10 @@ class LedvanceTuyaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             }
             try:
                 await _validate_credentials(self.hass, updated)
-            except InvalidAuthentication:
+            except (InvalidAuthentication, InvalidUserSession):
                 errors["base"] = "invalid_auth"
+            except TooManyRequests:
+                errors["base"] = "rate_limited"
             except CannotConnect:
                 errors["base"] = "cannot_connect"
             except Exception:  # noqa: BLE001
