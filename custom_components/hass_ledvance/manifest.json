@@ -14,5 +14,9 @@
     "pycryptodome>=3.17",
     "tinytuya>=1.17.4"
   ],
-  "version": "0.2.1"
+  "version": "0.2.1",
+  "categories": [
+    "lighting",
+    "plugs_switches"
+  ]
 }
