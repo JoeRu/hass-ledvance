@@ -12,6 +12,7 @@ from custom_components.hass_ledvance.__init__ import _async_assign_areas
     ("manual", None, False),
     (None, None, True),
     ("manual", "kitchen", False),
+    (None, "kitchen", False),  # user manually cleared a previous automatic area
     ("kitchen", "kitchen", True),
 ])
 async def test_preserves_manual_assignments(hass, current, assigned, should_update):

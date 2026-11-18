@@ -160,7 +160,9 @@ async def _async_assign_areas(
         assigned = coordinator._auto_area_assignments.get(dev_id)
         # A set area not assigned by this integration belongs to the user.
         # If the user moved one of our assigned devices, relinquish ownership.
-        if device_entry.area_id is not None and device_entry.area_id != assigned:
+        if (assigned is None and device_entry.area_id is not None) or (
+            assigned is not None and device_entry.area_id != assigned
+        ):
             coordinator._auto_area_assignments.pop(dev_id, None)
             continue
         if device_entry.area_id != area_id:
