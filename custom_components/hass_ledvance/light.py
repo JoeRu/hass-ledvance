@@ -18,7 +18,6 @@ from homeassistant.components.light import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util.color import (
     color_RGB_to_hs,
 )
@@ -37,7 +36,8 @@ from .const import (
     HA_COLOUR_TEMP_MAX_KELVIN,
     HA_COLOUR_TEMP_MIN_KELVIN,
 )
-from .coordinator import CoordinatorDeviceData, LedvanceTuyaCoordinator, build_device_info
+from .coordinator import CoordinatorDeviceData, LedvanceDeviceEntity, LedvanceTuyaCoordinator
+from .entity_discovery import register_discovered_entities
 from .local_control import async_send_and_update
 from .mixed_light import create_mixed_lights
 from .schema_parser import get_enum_range, get_integer_range
@@ -55,17 +55,17 @@ async def async_setup_entry(
 ) -> None:
     """Set up Ledvance/Tuya light entities."""
     coordinator: LedvanceTuyaCoordinator = hass.data[DOMAIN][entry.entry_id]
-    entities: list[LightEntity] = []
-    for dev_id, dev in coordinator.data.items():
+
+    def build_entities(dev_id: str, dev: CoordinatorDeviceData) -> list[LightEntity]:
         if dev.device_type != "light":
-            continue
+            return []
         mixed = create_mixed_lights(coordinator, entry, dev_id)
-        entities.extend(mixed or [LedvanceTuyaLight(coordinator, entry, dev_id)])
-    _LOGGER.debug("Setting up %d light entities", len(entities))
-    async_add_entities(entities)
+        return mixed or [LedvanceTuyaLight(coordinator, entry, dev_id)]
+
+    register_discovered_entities(coordinator, entry, async_add_entities, build_entities)
 
 
-class LedvanceTuyaLight(CoordinatorEntity[LedvanceTuyaCoordinator], LightEntity):
+class LedvanceTuyaLight(LedvanceDeviceEntity, LightEntity):
     """Representation of a Ledvance/Tuya light."""
 
     _attr_has_entity_name = True
@@ -77,13 +77,10 @@ class LedvanceTuyaLight(CoordinatorEntity[LedvanceTuyaCoordinator], LightEntity)
         entry: ConfigEntry,
         device_id: str,
     ) -> None:
-        super().__init__(coordinator)
-        self._device_id = device_id
-        self._entry = entry
+        super().__init__(coordinator, device_id)
         self._attr_unique_id = f"{entry.entry_id}_{device_id}"
 
-        dev = self._device_data
-        self._attr_device_info = build_device_info(dev)
+        dev = coordinator.data[device_id]
 
         # Determine supported colour modes from schema
         codes = {item.get("code") for item in dev.schema}
@@ -139,49 +136,47 @@ class LedvanceTuyaLight(CoordinatorEntity[LedvanceTuyaCoordinator], LightEntity)
     # ------------------------------------------------------------------
 
     @property
-    def _device_data(self) -> CoordinatorDeviceData:
-        return self.coordinator.data[self._device_id]
-
-    @property
     def available(self) -> bool:
-        return (
-            super().available
-            and self._device_id in self.coordinator.data
-            and self._device_data.is_online
-        )
+        return super().available and self._device_is_online
 
     @property
     def is_on(self) -> bool | None:
         if self._switch_dps is None:
             return None
-        return bool(self._device_data.dps.get(self._switch_dps))
+        return bool(self._state_dps.get(self._switch_dps))
 
     @property
     def brightness(self) -> int | None:
         if self._colour_dps and (self.color_mode == ColorMode.HS or self._bright_dps is None):
-            if colour := self._decode_colour_data(self._device_data.dps.get(self._colour_dps)):
+            if colour := self._decode_colour_data(self._state_dps.get(self._colour_dps)):
                 return colour[2]
         if self._bright_dps is None:
             return None
-        raw = self._device_data.dps.get(self._bright_dps)
+        raw = self._state_dps.get(self._bright_dps)
         if raw is None:
             return None
-        return self._tuya_to_ha_brightness(int(raw))
+        try:
+            return self._tuya_to_ha_brightness(int(raw))
+        except (TypeError, ValueError, OverflowError):
+            return None
 
     @property
     def color_temp_kelvin(self) -> int | None:
         if self._temp_dps is None:
             return None
-        raw = self._device_data.dps.get(self._temp_dps)
+        raw = self._state_dps.get(self._temp_dps)
         if raw is None:
             return None
-        return self._tuya_to_ha_color_temp(int(raw))
+        try:
+            return self._tuya_to_ha_color_temp(int(raw))
+        except (TypeError, ValueError, OverflowError):
+            return None
 
     @property
     def hs_color(self) -> tuple[float, float] | None:
         if self._colour_dps is None:
             return None
-        raw = self._device_data.dps.get(self._colour_dps)
+        raw = self._state_dps.get(self._colour_dps)
         if not raw:
             return None
         return self._parse_colour_data(str(raw))
@@ -191,7 +186,7 @@ class LedvanceTuyaLight(CoordinatorEntity[LedvanceTuyaCoordinator], LightEntity)
         """Return the active effect (scene/music mode), or None."""
         if not self._effect_modes or self._mode_dps is None:
             return None
-        mode = self._device_data.dps.get(self._mode_dps)
+        mode = self._state_dps.get(self._mode_dps)
         return mode if mode in self._effect_modes else None
 
     @property
@@ -199,7 +194,7 @@ class LedvanceTuyaLight(CoordinatorEntity[LedvanceTuyaCoordinator], LightEntity)
         """Return current colour mode based on work_mode DPS."""
         if self._mode_dps is None:
             return self._attr_color_mode  # type: ignore[return-value]
-        mode = self._device_data.dps.get(self._mode_dps)
+        mode = self._state_dps.get(self._mode_dps)
         if mode == "colour" and ColorMode.HS in self._attr_supported_color_modes:
             return ColorMode.HS
         if mode == "white":
@@ -224,7 +219,7 @@ class LedvanceTuyaLight(CoordinatorEntity[LedvanceTuyaCoordinator], LightEntity)
                 and (self.color_mode == ColorMode.HS or self._bright_dps is None)
             )
         )
-        colour = self._decode_colour_data(self._device_data.dps.get(self._colour_dps))
+        colour = self._decode_colour_data(self._state_dps.get(self._colour_dps))
         if ATTR_BRIGHTNESS in kwargs and self._bright_dps and not colour_mode:
             dps_dict[self._bright_dps] = self._ha_to_tuya_brightness(kwargs[ATTR_BRIGHTNESS])
             if self._mode_dps:
@@ -240,7 +235,7 @@ class LedvanceTuyaLight(CoordinatorEntity[LedvanceTuyaCoordinator], LightEntity)
             brightness = kwargs.get(
                 ATTR_BRIGHTNESS, colour[2] if colour else self.brightness or 255
             )
-            raw = self._device_data.dps.get(self._colour_dps)
+            raw = self._state_dps.get(self._colour_dps)
             dps_dict[self._colour_dps] = self._encode_colour_data(
                 hs, brightness, rgb=isinstance(raw, str) and len(raw.strip()) == 6
             )

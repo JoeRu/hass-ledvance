@@ -14,10 +14,9 @@ from homeassistant.components.light import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DPS_SWITCH_LED, HA_COLOUR_TEMP_MAX_KELVIN, HA_COLOUR_TEMP_MIN_KELVIN
-from .coordinator import CoordinatorDeviceData, LedvanceTuyaCoordinator, build_device_info
+from .coordinator import CoordinatorDeviceData, LedvanceDeviceEntity, LedvanceTuyaCoordinator
 from .local_control import async_send_and_update
 from .mix_rgbcw import MixedLightState, decode_mixed_light
 from .schema_parser import get_schema_property
@@ -44,14 +43,13 @@ def create_mixed_lights(
     ]
 
 
-class LedvanceMixedLight(CoordinatorEntity[LedvanceTuyaCoordinator], LightEntity):
+class LedvanceMixedLight(LedvanceDeviceEntity, LightEntity):
     """Combined power or one independent channel of a mixed light."""
 
     _attr_has_entity_name = True
 
     def __init__(self, coordinator, entry, device_id: str, mixed_dp: str, channel: str) -> None:
-        super().__init__(coordinator)
-        self._device_id = device_id
+        super().__init__(coordinator, device_id)
         self._mixed_dp = mixed_dp
         self._channel = channel
         dev = coordinator.data[device_id]
@@ -60,7 +58,6 @@ class LedvanceMixedLight(CoordinatorEntity[LedvanceTuyaCoordinator], LightEntity
         self._attr_name = {"combined": None, "white": "Main light", "colour": "Secondary light"}[
             channel
         ]
-        self._attr_device_info = build_device_info(dev)
         self._switch_dp = dev.dps_map.get(DPS_SWITCH_LED)
         mode = {"combined": ColorMode.ONOFF, "white": ColorMode.COLOR_TEMP, "colour": ColorMode.HS}[
             channel
@@ -71,27 +68,18 @@ class LedvanceMixedLight(CoordinatorEntity[LedvanceTuyaCoordinator], LightEntity
         self._attr_max_color_temp_kelvin = HA_COLOUR_TEMP_MAX_KELVIN
 
     @property
-    def _device_data(self) -> CoordinatorDeviceData:
-        return self.coordinator.data[self._device_id]
-
-    @property
     def _state(self) -> MixedLightState | None:
-        return decode_mixed_light(self._device_data.dps.get(self._mixed_dp))
+        return decode_mixed_light(self._state_dps.get(self._mixed_dp))
 
     @property
     def available(self) -> bool:
-        return (
-            super().available
-            and self._device_id in self.coordinator.data
-            and self._device_data.is_online
-            and self._state is not None
-        )
+        return super().available and self._device_is_online and self._state is not None
 
     @property
     def is_on(self) -> bool | None:
         if (state := self._state) is None:
             return None
-        if self._switch_dp and not self._device_data.dps.get(self._switch_dp):
+        if self._switch_dp and not self._state_dps.get(self._switch_dp):
             return False
         if self._channel == "white":
             return state.white_on

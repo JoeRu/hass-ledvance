@@ -9,7 +9,11 @@ import logging
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from http import HTTPStatus
+from threading import RLock, current_thread, local
 
 import requests
 from Crypto.PublicKey import RSA
@@ -40,10 +44,16 @@ API_VERSION_FOR_ACTION: dict[str, str] = {
 }
 DEFAULT_API_VERSION = "1.0"
 
-# Only these actions have their full result logged at debug level. Other results
-# (login, session refresh, device info, ...) can contain session IDs, refresh
-# tokens or device local keys and must never be logged.
-_LOGGABLE_RESULT_ACTIONS = frozenset({"tuya.m.device.dp.get", "tuya.m.device.dp.publish"})
+_IN_SIGNED_REQUEST = ContextVar("ledvance_signed_request", default=False)
+
+
+def _allow_transport_log(_record: logging.LogRecord) -> bool:
+    """Filter transport records only while this integration sends a signed request."""
+    return not _IN_SIGNED_REQUEST.get()
+
+
+for _logger_name in ("urllib3.connectionpool", "urllib3.util.retry"):
+    logging.getLogger(_logger_name).addFilter(_allow_transport_log)
 
 
 @dataclass
@@ -55,7 +65,7 @@ class DeviceInfo:
     name: str
     product_id: str
     is_online: bool
-    local_key: str
+    local_key: str = field(repr=False)
     mac: str
     schema: list  # parsed schema list
     dps: dict  # current DPS state dict (str keys)
@@ -89,6 +99,9 @@ class TuyaAPI:
         # Called with (sid, refresh_token) whenever either is renewed
         self._on_tokens_updated = on_tokens_updated
         self.session = requests.Session()
+        self._owner_thread = current_thread()
+        self._worker_sessions = local()
+        self._login_lock = RLock()
         self.sid: str | None = None
         self.refresh_token: str = ""
         self._room_versions: dict[str, str | None] = {}
@@ -112,6 +125,17 @@ class TuyaAPI:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _request_session(self) -> requests.Session:
+        """Give worker threads independent sessions; requests.Session isn't thread-safe."""
+        if current_thread() is self._owner_thread:
+            return self.session
+        session = getattr(self._worker_sessions, "session", None)
+        if session is None:
+            session = requests.Session()
+            self._worker_sessions.session = session
+        return session
+
 
     def _api(
         self,
@@ -165,32 +189,40 @@ class TuyaAPI:
 
         sanitized_data = data if data is not None else {}
         params["sign"] = self._sign({**params, **sanitized_data})
+        action = options.get("action", "")
 
         for rate_attempt in range(1, 4):
             try:
-                response = self.session.post(
-                    self._endpoint, params=params, data=data, headers=headers, timeout=15
-                )
-                action = options.get("action", "")
-                body = response.json()
+                log_token = _IN_SIGNED_REQUEST.set(True)
+                try:
+                    response = self._request_session().post(
+                        self._endpoint,
+                        params=params,
+                        data=data,
+                        headers=headers,
+                        timeout=15,
+                        allow_redirects=False,
+                    )
+                finally:
+                    _IN_SIGNED_REQUEST.reset(log_token)
+                # Never forward signed POST data or session IDs to redirect targets.
+                if 300 <= response.status_code < 400:
+                    raise CannotConnect("Cloud API returned an unexpected redirect")
+                body = self._response_body(response, action, requires_sid)
                 _LOGGER.debug(
-                    "API %s → HTTP %s success=%s errorCode=%s",
+                    "API %s → HTTP %s success=%s",
                     action,
                     response.status_code,
-                    body.get("success"),
-                    body.get("errorCode"),
+                    bool(body.get("success")),
                 )
-                result = self._handle(body, action, api_version)
-                if action in _LOGGABLE_RESULT_ACTIONS:
-                    _LOGGER.debug("API %s result: %s", action, result)
-                return result
+                return self._handle(body, action, api_version)
             except TooManyRequests:
                 if rate_attempt == 3:
                     raise
                 wait = 10.0 * rate_attempt
                 _LOGGER.warning(
                     "API rate limited on %s (attempt %d/3), retrying in %.0fs",
-                    options.get("action"),
+                    action,
                     rate_attempt,
                     wait,
                 )
@@ -199,20 +231,49 @@ class TuyaAPI:
                 params["time"] = str(int(time.time()))
                 params["requestId"] = str(uuid.uuid4())
                 params["sign"] = self._sign({**params, **sanitized_data})
-            except InvalidAuthentication:
-                raise
             except InvalidUserSession:
                 if not do_not_relogin:
                     _LOGGER.info("Session expired — re-logging in")
-                    self.login()
+                    with self._login_lock:
+                        # Re-login at most once for concurrent expired-session calls.
+                        old_sid = params.get("sid")
+                        if self.sid == old_sid:
+                            self.login()
                     return self._api(
                         options, post_data, requires_sid, True, api_version=api_version
                     )
                 raise
             except requests.RequestException as exc:
-                # requests exceptions can contain signed URLs, including the SID.
-                raise CannotConnect(f"Cloud request failed ({type(exc).__name__})") from exc
+                # Requests exceptions can contain signed URLs, including the SID.
+                raise CannotConnect(f"Cloud request failed ({type(exc).__name__})") from None
         raise AssertionError("unreachable")
+
+    def _response_body(
+        self, response: requests.Response, action: str, requires_sid: bool
+    ) -> dict:
+        """Classify HTTP and Tuya errors before returning a successful payload."""
+        status = response.status_code
+        if status == HTTPStatus.TOO_MANY_REQUESTS:
+            raise TooManyRequests("Cloud API rate limited")
+        if 400 <= status < 500:
+            try:
+                error = response.json()
+            except ValueError:
+                error = None
+            if isinstance(error, dict) and not error.get("success"):
+                self._raise_known_error(error.get("errorCode"), action)
+            if status == HTTPStatus.UNAUTHORIZED:
+                if requires_sid:
+                    raise InvalidUserSession("Cloud session is unauthorized")
+                raise InvalidAuthentication("Cloud authentication failed")
+        response.raise_for_status()
+        try:
+            body = response.json()
+        except ValueError:
+            raise CannotConnect("Cloud API returned invalid JSON") from None
+        if not isinstance(body, dict):
+            raise CannotConnect("Cloud API returned an unexpected payload")
+        return body
 
     def _sign(self, data: dict) -> str:
         KEYS_TO_SIGN = [
@@ -260,31 +321,24 @@ class TuyaAPI:
 
     def _handle(self, result: dict, action: str = "", api_version: str = "") -> dict | list:
         if result.get("success"):
+            if "result" not in result:
+                raise CannotConnect("Cloud API returned no result")
             return result["result"]
-        error_code = result.get("errorCode", "")
+        self._raise_known_error(result.get("errorCode"), action)
+        _LOGGER.error("Tuya cloud rejected the request (action=%s v=%s)", action, api_version)
+        raise ValueError("Tuya cloud rejected the request")
+
+    @staticmethod
+    def _raise_known_error(error_code: object, action: str) -> None:
+        """Map recognized service error codes without logging response contents."""
         if error_code == "API_OR_API_VERSION_WRONG" and action == "tuya.m.location.room.list":
             raise UnsupportedAPI(error_code)
         if error_code == "USER_SESSION_INVALID":
-            raise InvalidUserSession
+            raise InvalidUserSession("Cloud session expired")
         if error_code == "USER_PASSWD_WRONG":
-            _LOGGER.warning(
-                "Login rejected: %s: %s (endpoint=%s client_id=%s)",
-                error_code,
-                result.get("errorMsg"),
-                self._endpoint,
-                self._client_id,
-            )
-            raise InvalidAuthentication
+            raise InvalidAuthentication("Cloud credentials were rejected")
         if error_code == "REQUEST_TOO_FREQUENTLY_PLEASE_TRY_AGAIN_LATER":
-            raise TooManyRequests(result.get("errorMsg", "Rate limited"))
-        _LOGGER.error(
-            "API error %s: %s (action=%s v=%s)",
-            error_code,
-            result.get("errorMsg"),
-            action,
-            api_version,
-        )
-        raise ValueError(f"API error: {error_code} — {result.get('errorMsg')}")
+            raise TooManyRequests("Cloud API rate limited")
 
     def _enc_password(self, public_key: str, exponent: str, password: str) -> str:
         key = new_textbook_rsa(RSA.construct((int(public_key), int(exponent))))
@@ -297,7 +351,7 @@ class TuyaAPI:
     # Public API
     # ------------------------------------------------------------------
 
-    def login(self, _retries: int = 3, _backoff: float = 5.0) -> None:
+    def login(self) -> None:
         """Authenticate and store the session ID.
 
         Tries a silent refresh-token exchange first (no push notification).
@@ -309,27 +363,16 @@ class TuyaAPI:
             try:
                 self._refresh_session()
                 return
+            except TooManyRequests:
+                raise
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.debug(
-                    "Refresh token exchange failed (%s) — falling back to full login", exc
+                    "Refresh token exchange failed (%s) — falling back to full login",
+                    type(exc).__name__,
                 )
                 self.refresh_token = ""
 
-        for attempt in range(1, _retries + 1):
-            try:
-                self._login_once()
-                return
-            except TooManyRequests:
-                if attempt == _retries:
-                    raise
-                wait = _backoff * attempt
-                _LOGGER.warning(
-                    "Rate limited during login (attempt %d/%d), retrying in %.0fs",
-                    attempt,
-                    _retries,
-                    wait,
-                )
-                time.sleep(wait)
+        self._login_once()
 
     def _refresh_session(self) -> None:
         """Exchange the refresh token for a new SID without triggering a push notification."""
@@ -440,32 +483,39 @@ class TuyaAPI:
         room_map = self.rooms(group_id)
 
         raw_list = self._api({"action": "tuya.m.my.group.device.list", "gid": group_id})
+        if raw_list is None:
+            return []
+        if not isinstance(raw_list, list):
+            raise CannotConnect("Cloud API returned an invalid device list")
 
         # Build devId → roomName from the list payload (contains roomId per device)
         dev_room: dict[str, str] = {}
-        for dev in raw_list or []:  # type: ignore[union-attr]
-            dev_id = dev.get("devId")
-            room_id = str(dev.get("roomId", ""))
-            if dev_id and room_id and room_id in room_map:
-                dev_room[dev_id] = room_map[room_id]
+        for dev in raw_list:
+            if isinstance(dev, dict) and isinstance(dev_id := dev.get("devId"), str) and dev_id:
+                dev_room[dev_id] = room_map.get(str(dev.get("roomId", "")), "")
 
         result = []
-        for dev in raw_list or []:  # type: ignore[union-attr]
-            dev_id = dev.get("devId")
-            if not dev_id:
-                continue
-            try:
-                info = self._device_info(dev_id)
-                info.room_name = dev_room.get(dev_id, "")
+        # Use independent thread-local requests sessions and a bounded worker pool.
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="ledvance-cloud") as pool:
+            futures = [(dev_id, pool.submit(self._device_info, dev_id)) for dev_id in dev_room]
+            for dev_id, future in futures:
+                try:
+                    info = future.result()
+                except (InvalidAuthentication, InvalidUserSession, TooManyRequests):
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    _LOGGER.warning("Skipping device %s: %s", dev_id, type(exc).__name__)
+                    continue
+                info.room_name = dev_room[dev_id]
                 result.append(info)
-            except Exception as exc:  # noqa: BLE001
-                _LOGGER.warning("Skipping device %s: %s", dev_id, exc)
         return result
 
     def _device_info(self, device_id: str) -> DeviceInfo:
         raw = self._api({"action": "tuya.m.device.get"}, {"devId": device_id})
-        schema = json.loads(raw["schema"]) if isinstance(raw["schema"], str) else raw["schema"]
-        dps = raw.get("dps", {})
+        schema = raw.get("schema")
+        if isinstance(schema, str):
+            schema = json.loads(schema) if schema else None
+        dps = raw.get("dps") or {}
         # Normalise DPS keys to strings
         dps = {str(k): v for k, v in dps.items()}
         return DeviceInfo(
@@ -475,7 +525,7 @@ class TuyaAPI:
             product_id=raw.get("productId", ""),
             is_online=raw.get("isOnline", False),
             local_key=raw.get("localKey", ""),
-            mac=raw.get("mac", ""),
+            mac=raw.get("mac") or "",
             schema=schema,
             dps=dps,
             ip=raw.get("localIp") or raw.get("ip") or None,

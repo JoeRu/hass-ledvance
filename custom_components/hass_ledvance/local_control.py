@@ -83,7 +83,9 @@ async def async_send_and_update(
 ) -> None:
     """Update HA only after an accepted command; serialize concurrent writes."""
     async with coordinator.command_lock(device_id):
-        device = coordinator.data[device_id]
+        device = (coordinator.data or {}).get(device_id)
+        if device is None:
+            raise HomeAssistantError("The Ledvance/Tuya device is unavailable")
         patch = dps(device) if callable(dps) else dps
         if not await async_send_command(hass, coordinator.api, device, patch):
             raise HomeAssistantError(f"{device.name} did not accept the command over LAN or cloud")
