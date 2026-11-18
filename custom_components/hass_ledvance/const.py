@@ -11,6 +11,8 @@ CONF_REGION = "region"
 # Coordinator / polling
 DEFAULT_SCAN_INTERVAL = 30  # seconds
 LAN_SCAN_INTERVAL = 300  # rescan LAN every 5 minutes
+CLOUD_DISCOVERY_INTERVAL = 600  # re-read homes/rooms/device list from the cloud
+CLOUD_DISCOVERY_RETRY = 60  # retry a failed discovery sooner, keeping known devices
 
 # Ledvance app credentials (reverse-engineered from mobile app)
 TUYA_CLIENT_ID = "fx3fvkvusmw45d7jn8xh"

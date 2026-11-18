@@ -23,7 +23,13 @@ from homeassistant.helpers.update_coordinator import (
 
 from .api import DeviceInfo as TuyaDeviceInfo
 from .api import TuyaAPI
-from .const import DEFAULT_SCAN_INTERVAL, DOMAIN, LAN_SCAN_INTERVAL
+from .const import (
+    CLOUD_DISCOVERY_INTERVAL,
+    CLOUD_DISCOVERY_RETRY,
+    DEFAULT_SCAN_INTERVAL,
+    DOMAIN,
+    LAN_SCAN_INTERVAL,
+)
 from .device_io import device_lock
 from .exceptions import CannotConnect, InvalidAuthentication, InvalidUserSession, TooManyRequests
 from .schema_parser import detect_device_type, get_dps_map, normalize_schema
@@ -95,6 +101,11 @@ class LedvanceTuyaCoordinator(DataUpdateCoordinator[DevicesData]):
         self._lan_monitor_task: asyncio.Task | None = None
         self._command_locks: dict[str, asyncio.Lock] = {}
         self._cloud_retry_after: dict[str, float] = {}
+        # Cloud metadata (name, schema, local key, room, ...) from the last discovery.
+        # Discovery is expensive (one device.get per device), so it runs every
+        # CLOUD_DISCOVERY_INTERVAL; the regular poll reuses this cache.
+        self._metadata: dict[str, TuyaDeviceInfo] = {}
+        self._next_discovery: float | None = None  # monotonic; None = never discovered
 
     def command_lock(self, device_id: str) -> asyncio.Lock:
         """Serialize commands, including mixed-channel read/modify/write operations."""
@@ -122,6 +133,11 @@ class LedvanceTuyaCoordinator(DataUpdateCoordinator[DevicesData]):
             raise UpdateFailed(f"Tuya API rate limited — will retry next poll: {exc}") from exc
         except CannotConnect as exc:
             raise UpdateFailed(f"Cannot connect to Tuya cloud: {exc}") from exc
+
+    async def async_refresh_discovery(self) -> None:
+        """Refresh now, re-reading the device list and metadata from the cloud."""
+        self._next_discovery = 0.0
+        await self.async_refresh()
 
     @callback
     def async_start_lan_monitor(self) -> None:
@@ -151,13 +167,68 @@ class LedvanceTuyaCoordinator(DataUpdateCoordinator[DevicesData]):
         self._async_update_device(replace(dev, dps={**dev.dps, **dps_patch}))
 
     def _fetch_all_devices(self) -> DevicesData:
-        """Synchronous: fetch all devices from all groups."""
+        """Synchronous: poll every known device, re-running cloud discovery when due.
+
+        Cloud cost per regular poll: nothing for devices answering on LAN, and a
+        single device.get (state + online status + metadata) for each device
+        that does not. The full discovery (homes, rooms, device list and a
+        device.get per device) only runs every CLOUD_DISCOVERY_INTERVAL.
+        """
         # Re-login if needed (API auto-re-logins on session expiry,
         # but explicit login on first run or after auth error)
         if self.api.sid is None:
             self.api.login()
 
+        now = time.monotonic()
+        discovered = False
+        if self._next_discovery is None or now >= self._next_discovery:
+            try:
+                self._metadata = self._discover_devices()
+            except (TooManyRequests, CannotConnect) as exc:
+                if self._next_discovery is None:
+                    raise  # nothing known yet; setup cannot continue without the cloud
+                # Keep polling the known devices (LAN keeps working during a cloud
+                # outage) and retry discovery sooner than the regular interval.
+                self._next_discovery = now + CLOUD_DISCOVERY_RETRY
+                _LOGGER.warning(
+                    "Cloud discovery failed (%s); keeping %d known devices, retrying in %ds",
+                    type(exc).__name__, len(self._metadata), CLOUD_DISCOVERY_RETRY,
+                )
+            else:
+                self._next_discovery = now + CLOUD_DISCOVERY_INTERVAL
+                discovered = True
+
         result: DevicesData = {}
+        # At most three devices are polled concurrently. Each cloud worker uses
+        # its own Session, avoiding unsafe sharing of requests connection state.
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="ledvance-poll") as pool:
+            futures = [
+                (
+                    meta.dev_id,
+                    pool.submit(
+                        self._fetch_device, meta, self._lan_cache.get(meta.dev_id, {}), discovered
+                    ),
+                )
+                for meta in self._metadata.values()
+            ]
+            for device_id, future in futures:
+                try:
+                    device, refreshed = future.result()
+                except (TypeError, ValueError, OverflowError) as exc:
+                    _LOGGER.warning("Skipping device %s with invalid metadata (%s)", device_id, type(exc).__name__)
+                    continue
+                if refreshed is not None:
+                    # Picks up renamed devices and new local keys (e.g. after a reset).
+                    self._metadata[device_id] = refreshed
+                result[device.device_id] = device
+
+        _LOGGER.debug(
+            "Polled %d devices (%s)", len(result), "with cloud discovery" if discovered else "cached metadata"
+        )
+        return result
+
+    def _discover_devices(self) -> dict[str, TuyaDeviceInfo]:
+        """Synchronous: read all homes and their devices' metadata from the cloud."""
         try:
             groups = self.api.groups()
         except (InvalidAuthentication, InvalidUserSession, TooManyRequests, CannotConnect):
@@ -167,7 +238,7 @@ class LedvanceTuyaCoordinator(DataUpdateCoordinator[DevicesData]):
         if not isinstance(groups, list):
             raise CannotConnect("Cloud API returned an invalid group list")
 
-        device_jobs: list[tuple[TuyaDeviceInfo, dict]] = []
+        metadata: dict[str, TuyaDeviceInfo] = {}
         for group in groups:
             if not isinstance(group, dict):
                 continue
@@ -181,51 +252,59 @@ class LedvanceTuyaCoordinator(DataUpdateCoordinator[DevicesData]):
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning("Failed to fetch devices for group %s: %s", group_id, type(exc).__name__)
                 continue
-            device_jobs.extend((dev, self._lan_cache.get(dev.dev_id, {})) for dev in devices)
+            metadata.update((dev.dev_id, dev) for dev in devices)
 
-        # At most three devices are polled concurrently. Each cloud worker uses
-        # its own Session, avoiding unsafe sharing of requests connection state.
-        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="ledvance-poll") as pool:
-            futures = [(dev.dev_id, pool.submit(self._fetch_device, dev, lan)) for dev, lan in device_jobs]
-            for device_id, future in futures:
-                try:
-                    device = future.result()
-                except (TypeError, ValueError, OverflowError) as exc:
-                    _LOGGER.warning("Skipping device %s with invalid metadata (%s)", device_id, type(exc).__name__)
-                    continue
-                result[device.device_id] = device
+        _LOGGER.debug("Cloud discovery found %d devices", len(metadata))
+        return metadata
 
-        _LOGGER.debug("Fetched %d devices from cloud", len(result))
-        return result
+    def _fetch_device(
+        self, dev_info: TuyaDeviceInfo, lan: dict, cloud_fresh: bool = False
+    ) -> tuple[CoordinatorDeviceData, TuyaDeviceInfo | None]:
+        """Poll a device with LAN priority and bounded cloud failure backoff.
 
-    def _fetch_device(self, dev_info: TuyaDeviceInfo, lan: dict) -> CoordinatorDeviceData:
-        """Poll a device with LAN priority and bounded cloud failure backoff."""
-        schema = normalize_schema(dev_info.schema)
+        Returns the device data plus freshly fetched cloud metadata (or None when
+        the cloud was not asked). ``cloud_fresh`` means ``dev_info`` was fetched in
+        this same refresh, so its state is used instead of asking the cloud again.
+        """
         dps = self._poll_dps_local(
             dev_info.dev_id, lan.get("ip"), dev_info.local_key, lan.get("version")
         )
         lan_reachable = dps is not None
+        refreshed: TuyaDeviceInfo | None = None
         if not lan_reachable:
-            now = time.monotonic()
-            if now >= self._cloud_retry_after.get(dev_info.dev_id, 0):
-                try:
-                    dps = self.api.get_dps(dev_info.dev_id)
-                    self._cloud_retry_after.pop(dev_info.dev_id, None)
-                except (InvalidAuthentication, InvalidUserSession, TooManyRequests):
-                    raise
-                except Exception as exc:  # noqa: BLE001
-                    # Don't retry a persistently failing device on every refresh.
-                    self._cloud_retry_after[dev_info.dev_id] = now + 60
-                    _LOGGER.warning(
-                        "Cloud DPS for %s unavailable (%s); retrying later",
-                        dev_info.dev_id, type(exc).__name__,
-                    )
-            if dps is None:
+            if cloud_fresh:
                 dps = dev_info.dps
+            else:
+                now = time.monotonic()
+                if now >= self._cloud_retry_after.get(dev_info.dev_id, 0):
+                    try:
+                        # device.get costs the same single call as dp.get but also
+                        # reports isOnline, so cloud-only devices keep 30 s offline
+                        # detection between discoveries.
+                        refreshed = replace(
+                            self.api.device(dev_info.dev_id), room_name=dev_info.room_name
+                        )
+                        dev_info = refreshed
+                        dps = refreshed.dps
+                        self._cloud_retry_after.pop(dev_info.dev_id, None)
+                    except (InvalidAuthentication, InvalidUserSession, TooManyRequests):
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        # Don't retry a persistently failing device on every refresh.
+                        self._cloud_retry_after[dev_info.dev_id] = now + 60
+                        _LOGGER.warning(
+                            "Cloud state for %s unavailable (%s); retrying later",
+                            dev_info.dev_id, type(exc).__name__,
+                        )
+            if dps is None:
+                # Keep the newest known state; the discovery snapshot may be minutes old.
+                previous = (self.data or {}).get(dev_info.dev_id)
+                dps = previous.dps if previous is not None else dev_info.dps
         if not isinstance(dps, dict):
             raise ValueError("Unexpected device state")
+        schema = normalize_schema(dev_info.schema)
 
-        return CoordinatorDeviceData(
+        device = CoordinatorDeviceData(
             device_id=dev_info.dev_id,
             gateway_id=dev_info.gateway_id,
             name=dev_info.name,
@@ -244,6 +323,7 @@ class LedvanceTuyaCoordinator(DataUpdateCoordinator[DevicesData]):
             room_name=dev_info.room_name,
             lan_reachable=lan_reachable,
         )
+        return device, refreshed
 
     @staticmethod
     def _poll_dps_local(

@@ -519,6 +519,10 @@ class TuyaAPI:
                 result.append(info)
         return result
 
+    def device(self, device_id: str) -> DeviceInfo:
+        """Return fresh metadata, state and cloud online status for one device."""
+        return self._device_info(device_id)
+
     def _device_info(self, device_id: str) -> DeviceInfo:
         raw = self._api({"action": "tuya.m.device.get"}, {"devId": device_id})
         schema = raw.get("schema")

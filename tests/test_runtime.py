@@ -1,6 +1,7 @@
 """Exercise Ledvance entities and coordinator lifecycle through Home Assistant."""
 
 import asyncio
+from dataclasses import replace
 from threading import Event
 from unittest.mock import MagicMock, patch
 
@@ -53,7 +54,7 @@ async def test_platforms_recover_on_discovery_and_stop_after_unload(hass):
     api.sid = "test-session"
     api.groups.return_value = [{"groupId": "home"}]
     api.devices.side_effect = lambda _group: list(devices)
-    api.get_dps.side_effect = lambda dev_id: next(dev.dps for dev in devices if dev.dev_id == dev_id)
+    api.device.side_effect = lambda dev_id: replace(next(dev for dev in devices if dev.dev_id == dev_id))
 
     registry = er.async_get(hass)
     legacy_key = registry.async_get_or_create(
@@ -92,7 +93,7 @@ async def test_platforms_recover_on_discovery_and_stop_after_unload(hass):
         known_plug.schema = [{"id": 1, "code": "switch_1"}]
         known_plug.dps = {"1": True}
         devices.remove(strip)
-        await coordinator.async_refresh()
+        await coordinator.async_refresh_discovery()
         await hass.async_block_till_done()
         strip_states = [
             hass.states.get(entity.entity_id)
@@ -105,7 +106,7 @@ async def test_platforms_recover_on_discovery_and_stop_after_unload(hass):
         assert any(e.domain == "switch" and e.unique_id.endswith("_KnownPlug") for e in updated_registry)
 
         devices.append(strip)
-        await coordinator.async_refresh()
+        await coordinator.async_refresh_discovery()
         await hass.async_block_till_done()
         assert float(hass.states.get(current.entity_id).state) == 0.85
 

@@ -82,7 +82,7 @@ If you're deciding which integration to use, here is an honest comparison.
 | **Setup complexity** | Email + password — done | Requires manual local key extraction, device IP, and DPS mapping per device |
 | **Local key management** | Automatic — fetched from the cloud API on every reload | Manual — must be re-extracted after every factory reset or firmware update |
 | **Schema / DPS mapping** | Automatic — fetched from the cloud schema | Manual — you define which DPS does what |
-| **New device discovery** | Automatic on next poll | Manual entry for each device |
+| **New device discovery** | Automatic within 10 minutes (or on reload) | Manual entry for each device |
 | **LAN control** | Yes — auto-discovered IPs, cloud fallback | Yes — manual IPs, no cloud fallback |
 | **Cloud dependency** | Minimal — only for initial auth and when LAN fails | None at runtime |
 | **Tuya developer account** | Not required | Not required |
@@ -165,7 +165,9 @@ On first load and every 5 minutes thereafter, the integration performs a tinytuy
 
 ### State polling
 
-Every **30 seconds** the integration fetches device state. For devices found on LAN, state is read directly via the Tuya local protocol (encrypted TCP). For devices not on LAN, state falls back to the Tuya cloud API.
+Every **30 seconds** the integration fetches device state. For devices found on LAN, state is read directly via the Tuya local protocol (encrypted TCP) and no cloud request is made. For devices not on LAN, state (and the cloud's online status) is read with a single Tuya cloud request per device.
+
+The full cloud discovery — homes, rooms, the device list and each device's metadata (name, schema, local key) — runs on setup and every **10 minutes**. New, removed or renamed devices and Tuya room changes therefore show up within 10 minutes, or immediately after reloading the integration. If the cloud is unreachable, known devices keep being polled over LAN and discovery is retried after a minute.
 
 A device that responds to a LAN poll is immediately considered **online**, regardless of what the Tuya cloud reports. This gives significantly faster online/offline detection than relying on the cloud's heartbeat timeout (which can take 1–2 minutes).
 
