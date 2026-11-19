@@ -33,7 +33,7 @@ def _api(cloud: dict[str, DeviceInfo]) -> MagicMock:
     return api
 
 
-def _lan_poll(dev_id, ip, _key, _version):
+def _lan_poll(dev_id, ip, _key, _version, extra_dps=()):
     """Only the device found by the LAN scan answers locally."""
     return {"1": False} if ip else None
 
@@ -178,3 +178,127 @@ def test_cloud_backoff_keeps_newest_known_state(hass, lan_poll):
 
     assert data["Cloud"].dps == {"1": False}
     assert coordinator._cloud_retry_after["Cloud"] > time.monotonic()
+
+
+# Ledvance ceiling lights (protocol 3.3) answer a LAN status query with only a
+# subset of their DPs: DP51 (mix_rgbcw) and the scene DPs are missing.
+MIX_SCHEMA = [
+    {"id": 20, "code": "switch_led"},
+    {"id": 22, "code": "bright_value"},
+    {"id": 51, "code": "mix_rgbcw", "type": "raw", "mode": "rw"},
+]
+MIX_CLOUD_DPS = {"20": True, "21": "white", "22": 1000, "51": "AAcAOQPoA+gD6AMg"}
+
+
+def _mix_info(dev_id: str, dps: dict) -> DeviceInfo:
+    return DeviceInfo(dev_id, dev_id, dev_id, "", True, "key", "", MIX_SCHEMA, dps, room_name="Office")
+
+
+def test_partial_lan_status_keeps_dps_the_device_did_not_report(hass):
+    api = _api({"Lan": _mix_info("Lan", dict(MIX_CLOUD_DPS))})
+    coordinator = _coordinator(hass, api)
+    partial = {"20": False, "22": 500}
+
+    with patch.object(LedvanceTuyaCoordinator, "_poll_dps_local", return_value=partial) as poll:
+        coordinator.data = coordinator._fetch_all_devices()  # with discovery
+        first = coordinator.data["Lan"]
+        data = coordinator._fetch_all_devices()  # cached metadata, LAN only
+
+    assert first.dps == {**MIX_CLOUD_DPS, **partial}
+    assert data["Lan"].dps == {**MIX_CLOUD_DPS, **partial}
+    assert data["Lan"].lan_reachable
+    api.device.assert_not_called()
+    # The mixed-light DP is requested explicitly because status() omits it
+    assert poll.call_args.kwargs["extra_dps"] == ["51"]
+
+
+def test_partial_lan_poll_merges_onto_newer_lan_state(hass):
+    """Without discovery, the base is the newest known state, not the old cloud snapshot."""
+    api = _api({"Lan": _mix_info("Lan", dict(MIX_CLOUD_DPS))})
+    coordinator = _coordinator(hass, api)
+    with patch.object(LedvanceTuyaCoordinator, "_poll_dps_local", return_value={"20": True}):
+        coordinator.data = coordinator._fetch_all_devices()
+    coordinator.data["Lan"] = replace(coordinator.data["Lan"], dps={**MIX_CLOUD_DPS, "51": "AAEAAAAAAAAD6AAA"})
+
+    with patch.object(LedvanceTuyaCoordinator, "_poll_dps_local", return_value={"20": False}):
+        data = coordinator._fetch_all_devices()
+
+    assert data["Lan"].dps["51"] == "AAEAAAAAAAAD6AAA"
+    assert data["Lan"].dps["20"] is False
+
+
+def test_poll_dps_local_requests_missing_extra_dps():
+    device = MagicMock()
+    device.status.return_value = {"dps": {"20": True, "22": 10}}
+    device.updatedps.return_value = {"dps": {"51": "AAYAeAPoA8AACgAA"}}
+    tinytuya_mock = MagicMock()
+    tinytuya_mock.OutletDevice.return_value = device
+
+    with patch.dict("sys.modules", {"tinytuya": tinytuya_mock}):
+        dps = LedvanceTuyaCoordinator._poll_dps_local(
+            "dev", "192.168.1.10", "key", "3.3", extra_dps=["51"]
+        )
+
+    assert dps == {"20": True, "22": 10, "51": "AAYAeAPoA8AACgAA"}
+    device.updatedps.assert_called_once_with(["51"])
+
+
+@pytest.mark.parametrize(
+    "extra_reply",
+    [{"Error": "timeout", "Err": "902"}, None, OSError("reset")],
+)
+def test_poll_dps_local_ignores_failed_extra_dp_query(extra_reply):
+    device = MagicMock()
+    device.status.return_value = {"dps": {"20": True}}
+    if isinstance(extra_reply, Exception):
+        device.updatedps.side_effect = extra_reply
+    else:
+        device.updatedps.return_value = extra_reply
+    tinytuya_mock = MagicMock()
+    tinytuya_mock.OutletDevice.return_value = device
+
+    with patch.dict("sys.modules", {"tinytuya": tinytuya_mock}):
+        dps = LedvanceTuyaCoordinator._poll_dps_local(
+            "dev", "192.168.1.10", "key", "3.3", extra_dps=["51"]
+        )
+
+    assert dps == {"20": True}
+
+
+def test_poll_dps_local_skips_extra_query_when_status_has_the_dp():
+    device = MagicMock()
+    device.status.return_value = {"dps": {"20": True, "51": "AAYAeAPoA8AACgAA"}}
+    tinytuya_mock = MagicMock()
+    tinytuya_mock.OutletDevice.return_value = device
+
+    with patch.dict("sys.modules", {"tinytuya": tinytuya_mock}):
+        LedvanceTuyaCoordinator._poll_dps_local("dev", "192.168.1.10", "key", "3.3", extra_dps=["51"])
+
+    device.updatedps.assert_not_called()
+
+
+async def test_lan_monitor_partial_poll_keeps_unreported_dps(hass):
+    api = _api({"Lan": _mix_info("Lan", dict(MIX_CLOUD_DPS))})
+    coordinator = _coordinator(hass, api)
+    with patch.object(LedvanceTuyaCoordinator, "_poll_dps_local", return_value={"20": True}):
+        coordinator.data = coordinator._fetch_all_devices()
+    dev = coordinator.data["Lan"]
+
+    coordinator._async_apply_lan_poll(dev, {"20": False, "22": 10})
+
+    assert coordinator.data["Lan"].dps == {**MIX_CLOUD_DPS, "20": False, "22": 10}
+    assert coordinator.data["Lan"].lan_reachable
+
+
+async def test_lan_monitor_unchanged_partial_poll_publishes_nothing(hass):
+    api = _api({"Lan": _mix_info("Lan", dict(MIX_CLOUD_DPS))})
+    coordinator = _coordinator(hass, api)
+    with patch.object(LedvanceTuyaCoordinator, "_poll_dps_local", return_value={"20": True}):
+        coordinator.data = coordinator._fetch_all_devices()
+    dev = coordinator.data["Lan"]
+
+    with patch.object(coordinator, "async_update_listeners") as update:
+        coordinator._async_apply_lan_poll(dev, {"20": True})
+
+    update.assert_not_called()
+    assert coordinator.data["Lan"] is dev

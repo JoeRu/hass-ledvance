@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
+from functools import partial
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
@@ -35,6 +37,26 @@ from .exceptions import CannotConnect, InvalidAuthentication, InvalidUserSession
 from .schema_parser import detect_device_type, get_dps_map, normalize_schema
 
 _LOGGER = logging.getLogger(__name__)
+
+# DPs some devices leave out of a LAN status reply but return when asked for them.
+_LAN_EXTRA_DP_CODES = ("mix_rgbcw",)
+
+
+def _lan_extra_dps(dps_map: dict[str, str]) -> list[str]:
+    """Return the DPs to request explicitly during a LAN poll."""
+    return [dp for code in _LAN_EXTRA_DP_CODES if (dp := dps_map.get(code))]
+
+
+def _query_extra_dps(device, device_id: str, missing: list[str]) -> dict:
+    """Ask a tinytuya device for DPs its status reply omitted; partial results are fine."""
+    try:
+        reply = device.updatedps(missing)
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.debug("Extra DP query failed for %s: %s", device_id, type(exc).__name__)
+        return {}
+    if not isinstance(reply, dict) or "Error" in reply or not isinstance(reply.get("dps"), dict):
+        return {}
+    return {str(k): v for k, v in reply["dps"].items()}
 
 
 @dataclass
@@ -266,12 +288,24 @@ class LedvanceTuyaCoordinator(DataUpdateCoordinator[DevicesData]):
         the cloud was not asked). ``cloud_fresh`` means ``dev_info`` was fetched in
         this same refresh, so its state is used instead of asking the cloud again.
         """
+        schema = normalize_schema(dev_info.schema)
+        dps_map = get_dps_map(schema)
+        previous = (self.data or {}).get(dev_info.dev_id)
         dps = self._poll_dps_local(
-            dev_info.dev_id, lan.get("ip"), dev_info.local_key, lan.get("version")
+            dev_info.dev_id,
+            lan.get("ip"),
+            dev_info.local_key,
+            lan.get("version"),
+            extra_dps=_lan_extra_dps(dps_map),
         )
         lan_reachable = dps is not None
         refreshed: TuyaDeviceInfo | None = None
-        if not lan_reachable:
+        if lan_reachable:
+            # A LAN status can omit DPs (e.g. DP51 mix_rgbcw on ceiling lights);
+            # keep the newest known value of every DP the device did not report.
+            base = dev_info.dps if cloud_fresh or previous is None else previous.dps
+            dps = {**(base if isinstance(base, dict) else {}), **dps}
+        else:
             if cloud_fresh:
                 dps = dev_info.dps
             else:
@@ -298,11 +332,9 @@ class LedvanceTuyaCoordinator(DataUpdateCoordinator[DevicesData]):
                         )
             if dps is None:
                 # Keep the newest known state; the discovery snapshot may be minutes old.
-                previous = (self.data or {}).get(dev_info.dev_id)
                 dps = previous.dps if previous is not None else dev_info.dps
         if not isinstance(dps, dict):
             raise ValueError("Unexpected device state")
-        schema = normalize_schema(dev_info.schema)
 
         device = CoordinatorDeviceData(
             device_id=dev_info.dev_id,
@@ -311,7 +343,7 @@ class LedvanceTuyaCoordinator(DataUpdateCoordinator[DevicesData]):
             product_id=dev_info.product_id,
             device_type=detect_device_type(schema, dev_info.product_id),
             schema=schema,
-            dps_map=get_dps_map(schema),
+            dps_map=dps_map,
             dps=dps,
             local_key=dev_info.local_key,
             mac=dev_info.mac,
@@ -331,11 +363,14 @@ class LedvanceTuyaCoordinator(DataUpdateCoordinator[DevicesData]):
         ip: str | None,
         local_key: str,
         version: str | None,
+        extra_dps: Sequence[str] = (),
     ) -> dict | None:
         """Try to read DPS state from a device over LAN via tinytuya.
 
         Returns a normalised {dps_number_str: value} dict on success,
         or None if the device cannot be reached or tinytuya is unavailable.
+        ``extra_dps`` are queried explicitly when the status reply omits them;
+        the result may still be partial, so callers merge it onto known state.
         """
         if not (ip and local_key and version):
             return None
@@ -357,7 +392,10 @@ class LedvanceTuyaCoordinator(DataUpdateCoordinator[DevicesData]):
                 if isinstance(status, dict) and "Error" not in status:
                     raw = status.get("dps")
                     if isinstance(raw, dict) and raw:
-                        return {str(k): v for k, v in raw.items()}
+                        dps = {str(k): v for k, v in raw.items()}
+                        if missing := [dp for dp in extra_dps if dp not in dps]:
+                            dps.update(_query_extra_dps(d, device_id, missing))
+                        return dps
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.debug(
                     "Local DPS poll failed for %s (%s): %s", device_id, ip, type(exc).__name__
@@ -398,23 +436,37 @@ class LedvanceTuyaCoordinator(DataUpdateCoordinator[DevicesData]):
 
                     if ip and dev.local_key and version:
                         dps = await self.hass.async_add_executor_job(
-                            self._poll_dps_local, dev_id, ip, dev.local_key, version
+                            partial(
+                                self._poll_dps_local,
+                                dev_id,
+                                ip,
+                                dev.local_key,
+                                version,
+                                extra_dps=_lan_extra_dps(dev.dps_map),
+                            )
                         )
-                        lan_reachable = dps is not None
-                        # A poll must not overwrite a newer discovery or command result.
-                        if (self.data or {}).get(dev_id) is dev and (
-                            lan_reachable != dev.lan_reachable or (dps is not None and dps != dev.dps)
-                        ):
-                            self._async_update_device(replace(
-                                dev,
-                                dps=dps if dps is not None else dev.dps,
-                                is_online=lan_reachable or dev.is_online,
-                                lan_reachable=lan_reachable,
-                            ))
+                        self._async_apply_lan_poll(dev, dps)
 
                     await asyncio.sleep(gap)
         except asyncio.CancelledError:
             pass
+
+    @callback
+    def _async_apply_lan_poll(self, dev: CoordinatorDeviceData, dps: dict | None) -> None:
+        """Publish a LAN monitor poll result, merged onto the device's known DPs."""
+        # A poll must not overwrite a newer discovery or command result.
+        if (self.data or {}).get(dev.device_id) is not dev:
+            return
+        lan_reachable = dps is not None
+        merged = {**dev.dps, **dps} if dps is not None else dev.dps
+        if lan_reachable == dev.lan_reachable and merged == dev.dps:
+            return
+        self._async_update_device(replace(
+            dev,
+            dps=merged,
+            is_online=lan_reachable or dev.is_online,
+            lan_reachable=lan_reachable,
+        ))
 
     async def async_shutdown(self) -> None:
         """Stop the coordinator timer and cancel the LAN monitor."""

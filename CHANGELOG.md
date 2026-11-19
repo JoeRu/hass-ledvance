@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.3
+
+- Fix mixed white/RGB ceiling lights (DP51 `mix_rgbcw`) becoming unavailable as soon as the LAN scan found them: their LAN status reply omits DP51 and other DPs, and the poll replaced the known state with that subset. LAN polls now merge onto the known DPs, and DP51 is requested explicitly so it stays current without cloud calls.
+
 ## 0.2.2
 
 - Run full cloud discovery (homes, rooms, device list, per-device metadata) every 10 minutes instead of on every 30 s poll and after every command. Devices reachable on LAN now cost no cloud requests per poll; cloud-only devices cost one (`device.get`, which also keeps their online status current and picks up new local keys).
