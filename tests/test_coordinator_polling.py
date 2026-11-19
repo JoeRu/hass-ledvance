@@ -302,3 +302,24 @@ async def test_lan_monitor_unchanged_partial_poll_publishes_nothing(hass):
 
     update.assert_not_called()
     assert coordinator.data["Lan"] is dev
+
+
+async def test_lan_scan_keeps_addresses_of_devices_it_missed(hass):
+    """A powered-off device misses a scan; keep its address so the LAN monitor finds it on power-up."""
+    coordinator = LedvanceTuyaCoordinator(hass, _api({}))
+    scans = iter([
+        {"A": {"ip": "192.168.1.10", "version": "3.3"}, "B": {"ip": "192.168.1.11", "version": "3.3"}},
+        {"B": {"ip": "192.168.1.12", "version": "3.3"}},
+    ])
+    with (
+        patch.object(coordinator, "_scan_lan", side_effect=lambda: next(scans)),
+        patch.object(coordinator, "_fetch_all_devices", return_value={}),
+    ):
+        await coordinator._async_update_data()
+        coordinator._last_lan_scan = 0.0 - 10**6  # scan due again
+        await coordinator._async_update_data()
+
+    assert coordinator._lan_cache == {
+        "A": {"ip": "192.168.1.10", "version": "3.3"},  # missed: last known address kept
+        "B": {"ip": "192.168.1.12", "version": "3.3"},  # found: new address wins
+    }

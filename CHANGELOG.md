@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.4
+
+- Keep the last known LAN address of devices a LAN scan misses, for example while they are powered off. Previously the scan forgot them, so after power returned they came back only through cloud polling and stayed off LAN until the next scan (up to 5 minutes). Now the LAN monitor reconnects within seconds of the device rejoining Wi-Fi.
+
 ## 0.2.3
 
 - Fix mixed white/RGB ceiling lights (DP51 `mix_rgbcw`) becoming unavailable as soon as the LAN scan found them: their LAN status reply omits DP51 and other DPs, and the poll replaced the known state with that subset. LAN polls now merge onto the known DPs, and DP51 is requested explicitly so it stays current without cloud calls.

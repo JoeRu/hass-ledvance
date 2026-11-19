@@ -142,8 +142,13 @@ class LedvanceTuyaCoordinator(DataUpdateCoordinator[DevicesData]):
         if self._last_lan_scan is None or now - self._last_lan_scan >= LAN_SCAN_INTERVAL:
             self._last_lan_scan = now
             try:
-                self._lan_cache = await self.hass.async_add_executor_job(self._scan_lan)
-                _LOGGER.debug("LAN scan found %d devices", len(self._lan_cache))
+                found = await self.hass.async_add_executor_job(self._scan_lan)
+                # Keep the last known address of devices this scan missed (e.g. powered
+                # off), so the LAN monitor reconnects within seconds when they return
+                # instead of waiting for the next scan. A stale address only costs a
+                # failed local poll; a newly scanned address replaces it.
+                self._lan_cache = {**self._lan_cache, **found}
+                _LOGGER.debug("LAN scan found %d devices", len(found))
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning("LAN scan failed (non-fatal): %s", exc)
 
